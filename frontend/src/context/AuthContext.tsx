@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
-import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { auth, db } from '../firebase';
 import type { User, UserRole } from '../types';
 
@@ -9,6 +9,7 @@ interface AuthContextValue {
   isAuthenticated: boolean;
   isLoading:       boolean;
   login:           (username: string, password: string) => Promise<void>;
+  signup:          (username: string, password: string, role: UserRole) => Promise<void>;
   logout:          () => void;
   hasRole:         (...roles: UserRole[]) => boolean;
 }
@@ -48,6 +49,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser({ id: snap.id, ...snap.data() } as User);
   }, []);
 
+  const signup = useCallback(async (username: string, password: string, role: UserRole) => {
+    const email = `${username.trim()}@iuiupark.app`;
+    const cred  = await createUserWithEmailAndPassword(auth, email, password);
+    const userData = {
+      username: username.trim(),
+      role,
+      name: username.trim(),
+      email,
+      created_at: new Date().toISOString()
+    };
+    await setDoc(doc(db, 'users', cred.user.uid), userData);
+    setUser({ id: cred.user.uid, ...userData } as User);
+  }, []);
+
   const logout = useCallback(() => {
     signOut(auth);
     setUser(null);
@@ -58,7 +73,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [user]);
 
   return (
-    <AuthContext.Provider value={{ user, isAuthenticated: !!user, isLoading, login, logout, hasRole }}>
+    <AuthContext.Provider value={{ user, isAuthenticated: !!user, isLoading, login, signup, logout, hasRole }}>
       {children}
     </AuthContext.Provider>
   );
