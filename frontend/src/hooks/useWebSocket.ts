@@ -1,10 +1,5 @@
-/**
- * IUIU Smart Parking — Firebase Realtime Database hook
- * Replaces the WebSocket hook with the same interface.
- * Listens to /lots/{lotId}/realtime in Firebase RTDB.
- */
 import { useEffect, useRef, useCallback } from 'react';
-import { ref, onValue, set, off } from 'firebase/database';
+import { ref, onValue, set } from 'firebase/database';
 import { rtdb } from '../firebase';
 import type { WSMessage, WSMessageType } from '../types';
 
@@ -21,25 +16,24 @@ export function useLotWebSocket(lotId: string, handlers: HandlerMap) {
     isMounted.current = true;
     const lotRef = ref(rtdb, `lots/${lotId}/realtime`);
 
-    const unsub = onValue(lotRef, (snapshot) => {
+    // onValue returns the unsubscribe function directly in modular Firebase v9+
+    const unsubscribe = onValue(lotRef, (snapshot) => {
       if (!isMounted.current) return;
-      const data = snapshot.val();
-      if (!data) return;
-
-      const msg: WSMessage = data;
-      const handler = handlersRef.current[msg.type];
-      if (handler) handler(msg.payload);
+      const data = snapshot.val() as WSMessage | null;
+      if (!data?.type) return;
+      const handler = handlersRef.current[data.type];
+      if (handler) handler(data.payload);
     });
 
     return () => {
       isMounted.current = false;
-      off(lotRef, 'value', unsub);
+      unsubscribe();
     };
   }, [lotId]);
 
   const send = useCallback((msg: Record<string, unknown>) => {
-    const lotRef = ref(rtdb, `lots/${lotId}/commands`);
-    set(lotRef, { ...msg, timestamp: Date.now() });
+    const cmdRef = ref(rtdb, `lots/${lotId}/commands`);
+    set(cmdRef, { ...msg, timestamp: Date.now() });
   }, [lotId]);
 
   return { send };
