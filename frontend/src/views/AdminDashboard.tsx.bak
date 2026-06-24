@@ -1,0 +1,2495 @@
+/**
+ * IUIU Smart Parking — Admin Dashboard v2
+ * Full sidebar navigation with 7 sections:
+ *  1. Dashboard        – stats, pie chart, bar chart, today's vehicle table
+ *  2. Vehicle Categories – type breakdown & plates
+ *  3. Manage Slots & Gates – create/delete/monitor
+ *  4. Vehicles Parked  – active & exited vehicles
+ *  5. Attendants       – create/manage entrance, exit & parking staff
+ *  6. Pricing          – hourly rates per vehicle class
+ *  7. Fire Alerts      – real-time smoke detector notifications
+ */
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  lotsAPI, slotsAPI, slotTypesAPI, entrancesAPI, exitsAPI,
+  alertsAPI, ticketsAPI, usersAPI, assignmentsAPI,
+} from '../api/client';
+import { useLotWebSocket } from '../hooks/useWebSocket';
+import EntranceDisplayScreen from './EntranceDisplayScreen';
+import type {
+  ParkingLot, ParkingSlot, SlotType, Alert, LotAnalytics,
+  Entrance, Exit, Ticket, User, RevenueRow, AttendantAssignment,
+} from '../types';
+
+// ── Palette ──────────────────────────────────────────────────────────────────
+const G = {
+  primary: '#16a34a', dark: '#14532d', light: '#dcfce7', lighter: '#f0fdf4',
+  white:   '#ffffff', border: '#bbf7d0', text: '#111827',  muted: '#6b7280',
+  red:     '#dc2626', orange: '#d97706', blue: '#2563eb',  purple: '#7c3aed',
+  sidebar: '#0f3d1f',
+};
+
+// ── Vehicle type colours ─────────────────────────────────────────────────────
+const VTYPE_COLORS: Record<string, string> = {
+  car: '#2563eb', motorcycle: '#d97706', bicycle: '#16a34a',
+  van: '#7c3aed', truck: '#dc2626',
+};
+const VTYPE_ICONS: Record<string, string> = {
+  car: '🚗', motorcycle: '🏍', bicycle: '🚲', van: '🚐', truck: '🚛',
+};
+
+// ── Shared form styles ───────────────────────────────────────────────────────
+const fS = {
+  label: {
+    display: 'block' as const,
+    fontSize: 11, fontWeight: 700 as const, color: G.muted,
+    textTransform: 'uppercase' as const, letterSpacing: 0.6, marginBottom: 4,
+  },
+  input: {
+    display: 'block' as const, width: '100%', padding: '8px 12px',
+    border: `1.5px solid ${G.border}`, borderRadius: 8, fontSize: 13,
+    outline: 'none', background: G.white, color: G.text,
+    boxSizing: 'border-box' as const,
+  },
+  btn: {
+    padding: '9px 18px', background: G.primary, color: G.white,
+    border: 'none', borderRadius: 8, cursor: 'pointer',
+    fontWeight: 700 as const, fontSize: 13,
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SMALL SHARED COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function StatCard({ label, value, sub, accent = G.primary, icon }: {
+  label: string; value: string | number; sub?: string;
+  accent?: string; icon?: string;
+}) {
+  return (
+    <div style={{
+      background: G.white, border: `1.5px solid ${G.border}`,
+      borderRadius: 14, padding: '18px 20px',
+      borderLeft: `5px solid ${accent}`,
+      display: 'flex', alignItems: 'center', gap: 14,
+    }}>
+      {icon && <span style={{ fontSize: 28 }}>{icon}</span>}
+      <div>
+        <p style={{ margin: 0, fontSize: 11, color: G.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.8 }}>{label}</p>
+        <p style={{ margin: '4px 0 2px', fontSize: 26, fontWeight: 800, color: G.text }}>{value}</p>
+        {sub && <p style={{ margin: 0, fontSize: 12, color: G.muted }}>{sub}</p>}
+      </div>
+    </div>
+  );
+}
+
+function SectionTitle({ children, sub }: { children: React.ReactNode; sub?: string }) {
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: G.dark }}>{children}</h2>
+      {sub && <p style={{ margin: '4px 0 0', fontSize: 13, color: G.muted }}>{sub}</p>}
+    </div>
+  );
+}
+
+function Badge({ text, color = G.primary }: { text: string; color?: string }) {
+  return (
+    <span style={{
+      padding: '3px 10px', borderRadius: 20, background: color,
+      color: G.white, fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+    }}>{text}</span>
+  );
+}
+
+function Toast({ msg }: { msg: string }) {
+  if (!msg) return null;
+  return (
+    <div style={{
+      position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)',
+      background: G.dark, color: G.white, padding: '12px 28px',
+      borderRadius: 30, fontWeight: 700, fontSize: 14, zIndex: 9999,
+      boxShadow: '0 8px 30px rgba(0,0,0,0.3)', maxWidth: '90vw', textAlign: 'center',
+    }}>{msg}</div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SVG CHARTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function PieChart({ data }: {
+  data: { label: string; value: number; color: string }[];
+}) {
+  const total = data.reduce((s, d) => s + d.value, 0);
+  if (!total) return (
+    <div style={{ width: 220, height: 220, display: 'flex', alignItems: 'center', justifyContent: 'center', color: G.muted, fontSize: 13 }}>
+      No data
+    </div>
+  );
+
+  const cx = 110; const cy = 110; const r = 90;
+  let cumAngle = -90;
+
+  const slices = data.filter(d => d.value > 0).map(d => {
+    const pct = d.value / total;
+    const startAngle = cumAngle;
+    const endAngle   = cumAngle + pct * 360;
+    cumAngle = endAngle;
+    const large = pct > 0.5 ? 1 : 0;
+    const toRad  = (a: number) => (a * Math.PI) / 180;
+    const x1 = cx + r * Math.cos(toRad(startAngle));
+    const y1 = cy + r * Math.sin(toRad(startAngle));
+    const x2 = cx + r * Math.cos(toRad(endAngle));
+    const y2 = cy + r * Math.sin(toRad(endAngle));
+    const midAngle = (startAngle + endAngle) / 2;
+    const lx = cx + (r * 0.65) * Math.cos(toRad(midAngle));
+    const ly = cy + (r * 0.65) * Math.sin(toRad(midAngle));
+    return { d: `M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large} 1 ${x2},${y2} Z`, color: d.color, label: d.label, pct, lx, ly, value: d.value };
+  });
+
+  return (
+    <div>
+      <svg viewBox="0 0 220 220" width={220} height={220}>
+        {slices.map((s, i) => (
+          <g key={i}>
+            <path d={s.d} fill={s.color} stroke={G.white} strokeWidth={2} />
+            {s.pct > 0.07 && (
+              <text x={s.lx} y={s.ly} textAnchor="middle" dominantBaseline="middle"
+                fontSize={11} fontWeight={700} fill={G.white}>
+                {Math.round(s.pct * 100)}%
+              </text>
+            )}
+          </g>
+        ))}
+      </svg>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', marginTop: 8 }}>
+        {slices.map((s, i) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: G.text }}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, display: 'inline-block' }} />
+            {s.label} ({s.value})
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function BarChart({ data }: { data: { label: string; value: number }[] }) {
+  if (!data.length) return (
+    <div style={{ width: '100%', height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: G.muted, fontSize: 13 }}>
+      No revenue data
+    </div>
+  );
+  const maxVal = Math.max(...data.map(d => d.value), 1);
+  const barW   = Math.min(44, Math.floor(400 / data.length) - 8);
+  const chartH = 160; const chartW = Math.max(300, data.length * (barW + 10));
+
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <svg viewBox={`0 0 ${chartW} ${chartH + 40}`} width={chartW} height={chartH + 40}>
+        {data.map((d, i) => {
+          const barH = Math.max(4, (d.value / maxVal) * chartH);
+          const x    = i * (barW + 10) + 10;
+          const y    = chartH - barH;
+          return (
+            <g key={i}>
+              <rect x={x} y={y} width={barW} height={barH}
+                fill={G.primary} rx={4} opacity={0.85} />
+              <text x={x + barW / 2} y={y - 4} textAnchor="middle"
+                fontSize={9} fill={G.muted} fontWeight={600}>
+                {d.value > 999 ? `${Math.round(d.value / 1000)}k` : d.value}
+              </text>
+              <text x={x + barW / 2} y={chartH + 14} textAnchor="middle"
+                fontSize={9} fill={G.muted}>
+                {d.label}
+              </text>
+            </g>
+          );
+        })}
+        <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke={G.border} strokeWidth={1} />
+      </svg>
+    </div>
+  );
+}
+
+// ── Hourly Bar Chart ─────────────────────────────────────────────────────────
+// Visualises vehicles entered and exited per hour of the current day.
+function HourlyChart({ data }: {
+  data: { hour: number; entered: number; exited: number }[];
+}) {
+  if (!data.length) return (
+    <div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', color: G.muted, fontSize: 13 }}>
+      No entries yet today
+    </div>
+  );
+  const maxVal = Math.max(...data.map(d => Math.max(d.entered, d.exited)), 1);
+  const chartH = 140;
+  const barW   = 14;
+  const gap    = 4;
+  const groupW = barW * 2 + gap + 6;
+  const chartW = Math.max(300, data.length * groupW + 20);
+
+  const fmt = (h: number) => {
+    const ampm = h >= 12 ? 'pm' : 'am';
+    const h12  = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}${ampm}`;
+  };
+
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      {/* Legend */}
+      <div style={{ display: 'flex', gap: 16, marginBottom: 8, fontSize: 11, color: G.muted }}>
+        <span><span style={{ display: 'inline-block', width: 10, height: 10, background: G.primary, borderRadius: 2, marginRight: 4 }} />Entered</span>
+        <span><span style={{ display: 'inline-block', width: 10, height: 10, background: G.red, borderRadius: 2, marginRight: 4 }} />Exited</span>
+      </div>
+      <svg viewBox={`0 0 ${chartW} ${chartH + 30}`} width={chartW} height={chartH + 30}>
+        {data.map((d, i) => {
+          const x       = i * groupW + 10;
+          const entH    = Math.max(d.entered ? 4 : 0, (d.entered / maxVal) * chartH);
+          const extH    = Math.max(d.exited  ? 4 : 0, (d.exited  / maxVal) * chartH);
+          return (
+            <g key={i}>
+              {/* Entered bar */}
+              <rect x={x} y={chartH - entH} width={barW} height={entH}
+                fill={G.primary} rx={3} opacity={0.9} />
+              {d.entered > 0 && (
+                <text x={x + barW / 2} y={chartH - entH - 3} textAnchor="middle" fontSize={8} fill={G.primary} fontWeight={700}>
+                  {d.entered}
+                </text>
+              )}
+              {/* Exited bar */}
+              <rect x={x + barW + gap} y={chartH - extH} width={barW} height={extH}
+                fill={G.red} rx={3} opacity={0.7} />
+              {d.exited > 0 && (
+                <text x={x + barW + gap + barW / 2} y={chartH - extH - 3} textAnchor="middle" fontSize={8} fill={G.red} fontWeight={700}>
+                  {d.exited}
+                </text>
+              )}
+              {/* Hour label */}
+              <text x={x + barW} y={chartH + 14} textAnchor="middle" fontSize={9} fill={G.muted}>
+                {fmt(d.hour)}
+              </text>
+            </g>
+          );
+        })}
+        <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke={G.border} strokeWidth={1} />
+      </svg>
+    </div>
+  );
+}
+
+// ── Horizontal Type Bar ───────────────────────────────────────────────────────
+// Simple horizontal bars showing count per vehicle type.
+function HTypeBar({ data }: { data: { label: string; value: number; color: string; icon: string }[] }) {
+  const max = Math.max(...data.map(d => d.value), 1);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {data.map(d => (
+        <div key={d.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ width: 22, textAlign: 'center', fontSize: 16 }}>{d.icon}</span>
+          <span style={{ width: 80, fontSize: 12, color: G.muted, textTransform: 'capitalize' }}>{d.label}</span>
+          <div style={{ flex: 1, height: 18, background: '#f0fdf4', borderRadius: 4, overflow: 'hidden' }}>
+            <div style={{
+              width: `${(d.value / max) * 100}%`, height: '100%',
+              background: d.color, borderRadius: 4,
+              transition: 'width 0.5s ease',
+              minWidth: d.value ? 4 : 0,
+            }} />
+          </div>
+          <span style={{ width: 28, fontSize: 12, fontWeight: 700, color: d.color, textAlign: 'right' }}>{d.value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 1: DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════
+
+function DashboardSection({ analytics, todayTickets, revenueRows }: {
+  analytics: LotAnalytics | null;
+  todayTickets: Ticket[];
+  revenueRows: RevenueRow[];
+}) {
+  const [tableSearch, setTableSearch] = useState('');
+  const [tableFilter, setTableFilter] = useState<'all' | 'active' | 'exited'>('all');
+  const [sortCol, setSortCol]         = useState<'entry' | 'duration' | 'type'>('entry');
+  const [sortAsc, setSortAsc]         = useState(false);
+
+  if (!analytics) return (
+    <div style={{ padding: 40, textAlign: 'center', color: G.muted }}>Loading analytics…</div>
+  );
+
+  // ── Derived data ──────────────────────────────────────────────────────────
+  const TYPES = ['car', 'motorcycle', 'bicycle', 'van', 'truck'];
+
+  const activeToday = todayTickets.filter(t => t.status === 'active').length;
+  const exitedToday = todayTickets.filter(t => t.status !== 'active').length;
+
+  // Slot status pie data (reserved derived from capacity - occupied - vacant)
+  const reservedCount = Math.max(0, analytics.total_capacity - analytics.occupied - analytics.vacant);
+  const slotPieData = [
+    { label: 'Vacant',   value: analytics.vacant,   color: G.primary },
+    { label: 'Occupied', value: analytics.occupied,  color: G.red     },
+    { label: 'Reserved', value: reservedCount,        color: G.orange  },
+  ].filter(d => d.value > 0);
+
+  // Vehicle type pie data (from today's tickets)
+  const typePieData = TYPES.map(t => ({
+    label: t, color: VTYPE_COLORS[t] ?? G.muted,
+    value: todayTickets.filter(tk => tk.vehicle_type === t).length,
+  })).filter(d => d.value > 0);
+
+  // Vehicle type horizontal bar
+  const typeBarData = TYPES.map(t => ({
+    label: t, icon: VTYPE_ICONS[t] ?? '🚗', color: VTYPE_COLORS[t] ?? G.muted,
+    value: todayTickets.filter(tk => tk.vehicle_type === t).length,
+  }));
+
+  // Hourly entry/exit data from todayTickets
+  const nowHour = new Date().getHours();
+  const hourlyData = Array.from({ length: nowHour + 1 }, (_, h) => ({
+    hour: h,
+    entered: todayTickets.filter(t => new Date(t.entry_time).getHours() === h).length,
+    exited:  todayTickets.filter(t => t.exit_time && new Date(t.exit_time).getHours() === h).length,
+  }));
+
+  // Revenue bar
+  const revBarData = revenueRows.slice(-7).map(r => ({
+    label: String(r.day).slice(5),
+    value: Number(r.revenue),
+  }));
+
+  // Table filtering + sorting
+  const filtered = todayTickets
+    .filter(t => {
+      if (tableFilter === 'active'  && t.status !== 'active') return false;
+      if (tableFilter === 'exited'  && t.status === 'active') return false;
+      const q = tableSearch.toLowerCase();
+      if (!q) return true;
+      return (
+        (t.license_plate ?? '').toLowerCase().includes(q) ||
+        t.vehicle_type.toLowerCase().includes(q) ||
+        String(t.ticket_number).includes(q) ||
+        (t.slot_number ?? '').toLowerCase().includes(q)
+      );
+    })
+    .sort((a, b) => {
+      let cmp = 0;
+      if (sortCol === 'entry')    cmp = new Date(a.entry_time).getTime() - new Date(b.entry_time).getTime();
+      if (sortCol === 'duration') cmp = a.duration_hours - b.duration_hours;
+      if (sortCol === 'type')     cmp = a.vehicle_type.localeCompare(b.vehicle_type);
+      return sortAsc ? cmp : -cmp;
+    });
+
+  const toggleSort = (col: typeof sortCol) => {
+    if (sortCol === col) setSortAsc(a => !a);
+    else { setSortCol(col); setSortAsc(false); }
+  };
+  const sortArrow = (col: typeof sortCol) => sortCol === col ? (sortAsc ? ' ▲' : ' ▼') : '';
+
+  return (
+    <div>
+      <SectionTitle sub={`Live overview · ${new Date().toLocaleDateString('en-UG', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}`}>
+        📊 Dashboard
+      </SectionTitle>
+
+      {/* ── KPI stat cards ─────────────────────────────────────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: 14, marginBottom: 24 }}>
+        <StatCard label="Total Capacity"  value={analytics.total_capacity}                                         icon="🅿" />
+        <StatCard label="Occupied Slots"  value={analytics.occupied}       accent={G.red}                         icon="🔴" />
+        <StatCard label="Vacant Slots"    value={analytics.vacant}         accent={G.primary}                     icon="🟢" />
+        <StatCard label="Occupancy"       value={`${analytics.occupancy_rate}%`} accent={G.orange}               icon="📈" />
+        <StatCard label="Entered Today"   value={analytics.tickets_today}                                          icon="🎫" />
+        <StatCard label="Revenue Today"   value={`UGX ${Number(analytics.revenue_today).toLocaleString()}`} accent={G.blue} icon="💰" />
+        <StatCard label="Revenue Month"   value={`UGX ${Number(analytics.revenue_month).toLocaleString()}`} accent={G.dark} icon="📅" />
+      </div>
+
+      {/* ── Status summary chips ────────────────────────────────────────── */}
+      <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap' }}>
+        {[
+          { label: '🟢 Still Parked',  value: activeToday, bg: G.light,     color: G.dark,    filter: 'active'  as const },
+          { label: '🚪 Left Today',    value: exitedToday, bg: '#fef2f2',   color: G.red,     filter: 'exited'  as const },
+          { label: '🅿 Available Now', value: analytics.vacant, bg: '#eff6ff', color: G.blue,  filter: 'all'     as const },
+        ].map(chip => (
+          <button key={chip.label}
+            onClick={() => setTableFilter(f => f === chip.filter && chip.filter !== 'all' ? 'all' : chip.filter)}
+            style={{
+              padding: '10px 20px', borderRadius: 10, cursor: 'pointer',
+              background: chip.bg, color: chip.color,
+              border: `2px solid ${tableFilter === chip.filter ? chip.color : 'transparent'}`,
+              fontWeight: 700, fontSize: 13,
+            }}>
+            {chip.label}: <span style={{ fontSize: 18 }}>{chip.value}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* ── Three-column chart row ──────────────────────────────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16, marginBottom: 24 }}>
+
+        {/* Slot status pie */}
+        <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '18px 20px' }}>
+          <h3 style={{ margin: '0 0 12px', fontSize: 13, fontWeight: 700, color: G.dark }}>🅿 Slot Status</h3>
+          <div style={{ display: 'flex', justifyContent: 'center' }}>
+            <PieChart data={slotPieData} />
+          </div>
+        </div>
+
+        {/* Vehicle type distribution */}
+        <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '18px 20px' }}>
+          <h3 style={{ margin: '0 0 12px', fontSize: 13, fontWeight: 700, color: G.dark }}>🚗 Vehicle Types Today</h3>
+          {typePieData.length ? (
+            <div style={{ display: 'flex', justifyContent: 'center' }}>
+              <PieChart data={typePieData} />
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 0, marginTop: 8 }}>
+              <HTypeBar data={typeBarData} />
+            </div>
+          )}
+        </div>
+
+        {/* Revenue bar */}
+        <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '18px 20px' }}>
+          <h3 style={{ margin: '0 0 12px', fontSize: 13, fontWeight: 700, color: G.dark }}>💰 Revenue — Last 7 Days</h3>
+          {revBarData.length ? <BarChart data={revBarData} /> : (
+            <p style={{ color: G.muted, fontSize: 13, textAlign: 'center', paddingTop: 40 }}>No revenue data yet.</p>
+          )}
+        </div>
+      </div>
+
+      {/* ── Hourly entry/exit chart ─────────────────────────────────────── */}
+      <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '18px 20px', marginBottom: 24 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+          <h3 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: G.dark }}>
+            ⏱ Vehicles Entered / Exited Per Hour Today
+          </h3>
+          <span style={{ fontSize: 11, color: G.muted }}>
+            Total today: <strong>{todayTickets.length}</strong> &nbsp;|&nbsp;
+            Peak hour: <strong>
+              {hourlyData.length ? (() => {
+                const peak = hourlyData.reduce((m, d) => d.entered > m.entered ? d : m, hourlyData[0]);
+                return `${peak.hour}:00 (${peak.entered} in)`;
+              })() : '—'}
+            </strong>
+          </span>
+        </div>
+        <HourlyChart data={hourlyData} />
+      </div>
+
+      {/* ── Vehicle type breakdown bar (always visible) ─────────────────── */}
+      <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '18px 20px', marginBottom: 24 }}>
+        <h3 style={{ margin: '0 0 14px', fontSize: 13, fontWeight: 700, color: G.dark }}>🚗 Vehicle Type Breakdown</h3>
+        <HTypeBar data={typeBarData} />
+      </div>
+
+      {/* ── Today's Vehicles Table ──────────────────────────────────────── */}
+      <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, overflow: 'hidden' }}>
+        {/* Table header */}
+        <div style={{ padding: '14px 20px', borderBottom: `1px solid ${G.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: G.dark }}>
+            🗒 Vehicles Entered Today
+            <span style={{ marginLeft: 8, fontWeight: 400, fontSize: 12, color: G.muted }}>({filtered.length} of {todayTickets.length})</span>
+          </h3>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            {/* Status filter */}
+            {(['all', 'active', 'exited'] as const).map(f => (
+              <button key={f} onClick={() => setTableFilter(f)} style={{
+                padding: '5px 12px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                border: `1.5px solid ${tableFilter === f ? G.primary : G.border}`,
+                background: tableFilter === f ? G.primary : G.white,
+                color: tableFilter === f ? G.white : G.muted,
+                fontWeight: tableFilter === f ? 700 : 400,
+              }}>
+                {f === 'all' ? 'All' : f === 'active' ? '🟢 Parked' : '🚪 Exited'}
+              </button>
+            ))}
+            {/* Search */}
+            <input
+              value={tableSearch}
+              onChange={e => setTableSearch(e.target.value)}
+              placeholder="Search plate / type / slot…"
+              style={{ padding: '6px 12px', borderRadius: 8, border: `1.5px solid ${G.border}`, fontSize: 12, outline: 'none', width: 200 }}
+            />
+          </div>
+        </div>
+
+        {filtered.length === 0 ? (
+          <p style={{ textAlign: 'center', padding: 40, color: G.muted }}>
+            {todayTickets.length === 0 ? 'No vehicles recorded today.' : 'No vehicles match the current filter.'}
+          </p>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: G.lighter }}>
+                  {[
+                    { key: null,       label: 'Ticket #'     },
+                    { key: 'type',     label: 'Type'         },
+                    { key: null,       label: 'License Plate' },
+                    { key: 'entry',    label: 'Entry Time'   },
+                    { key: 'duration', label: 'Hours Spent'  },
+                    { key: null,       label: 'Slot'         },
+                    { key: null,       label: 'Available'    },
+                    { key: null,       label: 'Status'       },
+                  ].map((h, idx) => (
+                    <th key={idx}
+                      onClick={h.key ? () => toggleSort(h.key as any) : undefined}
+                      style={{
+                        padding: '10px 14px', textAlign: 'left',
+                        fontWeight: 700, color: G.dark, fontSize: 12,
+                        borderBottom: `1px solid ${G.border}`,
+                        cursor: h.key ? 'pointer' : 'default',
+                        userSelect: 'none',
+                        whiteSpace: 'nowrap',
+                      }}>
+                      {h.label}{h.key ? sortArrow(h.key as any) : ''}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((t, i) => {
+                  const hrs     = Math.floor(t.duration_hours);
+                  const mins    = Math.floor((t.duration_hours - hrs) * 60);
+                  const isActive = t.status === 'active';
+                  return (
+                    <tr key={t.id} style={{ borderBottom: `1px solid ${G.border}`, background: i % 2 === 0 ? G.white : G.lighter }}>
+                      <td style={{ padding: '10px 14px', fontWeight: 700, color: G.dark, whiteSpace: 'nowrap' }}>
+                        #{t.ticket_number}
+                      </td>
+                      <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                        <span style={{ marginRight: 5, fontSize: 16 }}>{VTYPE_ICONS[t.vehicle_type] ?? '🚗'}</span>
+                        <span style={{ textTransform: 'capitalize', fontWeight: 600 }}>{t.vehicle_type}</span>
+                      </td>
+                      <td style={{ padding: '10px 14px', fontFamily: 'monospace', letterSpacing: 1.2, fontWeight: 700, fontSize: 13 }}>
+                        {t.license_plate
+                          ? <span style={{ background: '#1e293b', color: '#f1f5f9', padding: '3px 10px', borderRadius: 4, display: 'inline-block' }}>{t.license_plate}</span>
+                          : <span style={{ color: G.muted }}>— no plate —</span>
+                        }
+                      </td>
+                      <td style={{ padding: '10px 14px', color: G.muted, whiteSpace: 'nowrap' }}>
+                        {new Date(t.entry_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </td>
+                      <td style={{ padding: '10px 14px', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                        <span style={{ color: hrs >= 8 ? G.red : hrs >= 4 ? G.orange : G.dark }}>
+                          {hrs}h {mins}m
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 14px', fontWeight: 600, color: G.dark }}>
+                        {t.slot_number ?? <span style={{ color: G.muted }}>—</span>}
+                      </td>
+                      <td style={{ padding: '10px 14px' }}>
+                        <span style={{
+                          padding: '3px 10px', borderRadius: 20, fontSize: 11, fontWeight: 700,
+                          background: isActive ? '#dcfce7' : '#f1f5f9',
+                          color: isActive ? G.dark : G.muted,
+                        }}>
+                          {isActive ? `${analytics.vacant} slots free` : 'Left'}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 14px' }}>
+                        <Badge
+                          text={isActive ? 'Still Parked' : t.status === 'paid' ? 'Exited' : t.status}
+                          color={isActive ? G.primary : t.status === 'paid' ? G.muted : G.orange}
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 2: VEHICLE CATEGORIES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function VehicleCategoriesSection({ tickets }: { tickets: Ticket[] }) {
+  const [filter,   setFilter]   = useState<string>('all');
+  const [search,   setSearch]   = useState('');
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+
+  const TYPES = ['car', 'motorcycle', 'bicycle', 'van', 'truck'];
+
+  // Group tickets by type
+  const grouped = TYPES.reduce<Record<string, Ticket[]>>((acc, t) => {
+    acc[t] = tickets.filter(tk => tk.vehicle_type === t);
+    return acc;
+  }, {});
+
+  const total = tickets.length;
+
+  // Filtered table rows
+  const shown = tickets.filter(t => {
+    if (filter !== 'all' && t.vehicle_type !== filter) return false;
+    const q = search.toLowerCase();
+    if (!q) return true;
+    return (
+      (t.license_plate ?? '').toLowerCase().includes(q) ||
+      t.vehicle_type.toLowerCase().includes(q) ||
+      (t.slot_number  ?? '').toLowerCase().includes(q) ||
+      String(t.ticket_number).includes(q)
+    );
+  });
+
+  // Type distribution pie (all tickets)
+  const pieData = TYPES
+    .map(t => ({ label: t, value: grouped[t].length, color: VTYPE_COLORS[t] ?? G.muted }))
+    .filter(d => d.value > 0);
+
+  const toggleExpand = (type: string) =>
+    setExpanded(prev => ({ ...prev, [type]: !prev[type] }));
+
+  return (
+    <div>
+      <SectionTitle sub="Live breakdown of every vehicle type that has entered — with license plates">
+        🚗 Vehicle Categories
+      </SectionTitle>
+
+      {/* ── Top row: type cards + pie ─────────────────────────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 260px', gap: 20, marginBottom: 24, alignItems: 'start' }}>
+
+        {/* Type cards */}
+        <div>
+          <p style={{ margin: '0 0 10px', fontSize: 12, color: G.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.8 }}>
+            Click a category to filter the table ↓
+          </p>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+            {/* All button */}
+            <button onClick={() => setFilter('all')} style={{
+              padding: '12px 18px', borderRadius: 12,
+              border: `2px solid ${filter === 'all' ? G.dark : G.border}`,
+              background: filter === 'all' ? G.dark : G.white,
+              color: filter === 'all' ? G.white : G.muted,
+              cursor: 'pointer', fontWeight: 700, fontSize: 13,
+            }}>
+              All ({total})
+            </button>
+
+            {TYPES.map(type => {
+              const count = grouped[type].length;
+              const active = filter === type;
+              const color  = VTYPE_COLORS[type] ?? G.muted;
+              const pct    = total ? Math.round((count / total) * 100) : 0;
+              return (
+                <button key={type} onClick={() => setFilter(active ? 'all' : type)} style={{
+                  padding: '12px 18px', borderRadius: 12,
+                  border: `2px solid ${active ? color : G.border}`,
+                  background: active ? color : G.white,
+                  color: active ? G.white : G.text,
+                  cursor: 'pointer',
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+                  minWidth: 88, position: 'relative', overflow: 'hidden',
+                }}>
+                  {/* Progress fill bar at bottom */}
+                  {!active && count > 0 && (
+                    <div style={{
+                      position: 'absolute', bottom: 0, left: 0,
+                      width: `${pct}%`, height: 4,
+                      background: color, borderRadius: '0 0 0 0',
+                      opacity: 0.5,
+                    }} />
+                  )}
+                  <span style={{ fontSize: 24 }}>{VTYPE_ICONS[type]}</span>
+                  <span style={{ fontWeight: 900, fontSize: 24, lineHeight: 1 }}>{count}</span>
+                  <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5 }}>{type}</span>
+                  <span style={{ fontSize: 10, opacity: 0.7 }}>{pct}% of today</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Per-type collapsible plate lists */}
+          {TYPES.filter(t => grouped[t].length > 0).map(type => {
+            const list = grouped[type];
+            const color = VTYPE_COLORS[type];
+            const isOpen = expanded[type] ?? false;
+            return (
+              <div key={type} style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 12, marginBottom: 8, overflow: 'hidden' }}>
+                <button
+                  onClick={() => toggleExpand(type)}
+                  style={{
+                    width: '100%', display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '12px 16px', border: 'none', background: 'transparent',
+                    cursor: 'pointer', textAlign: 'left',
+                    borderLeft: `5px solid ${color}`,
+                  }}>
+                  <span style={{ fontSize: 20 }}>{VTYPE_ICONS[type]}</span>
+                  <span style={{ fontWeight: 700, fontSize: 14, color: G.dark, flex: 1, textTransform: 'capitalize' }}>{type}</span>
+                  <span style={{
+                    background: color, color: G.white,
+                    borderRadius: 20, padding: '2px 10px', fontSize: 12, fontWeight: 700,
+                  }}>{list.length} vehicle{list.length !== 1 ? 's' : ''}</span>
+                  <span style={{ fontSize: 12, color: G.muted, marginLeft: 8 }}>
+                    {isOpen ? '▲ Hide plates' : '▼ Show plates'}
+                  </span>
+                </button>
+                {isOpen && (
+                  <div style={{ padding: '4px 16px 14px', borderTop: `1px solid ${G.border}` }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                      {list.map(t => (
+                        <div key={t.id} style={{
+                          display: 'flex', alignItems: 'center', gap: 6,
+                          background: G.lighter, borderRadius: 8, padding: '6px 12px',
+                          border: `1px solid ${G.border}`,
+                        }}>
+                          <span style={{
+                            fontFamily: 'monospace', fontWeight: 800, fontSize: 13,
+                            background: '#1e293b', color: '#f1f5f9',
+                            padding: '2px 8px', borderRadius: 4, letterSpacing: 1.2,
+                          }}>
+                            {t.license_plate || '?????'}
+                          </span>
+                          <span style={{ fontSize: 11, color: G.muted }}>
+                            {t.slot_number ? `Slot ${t.slot_number}` : ''}
+                          </span>
+                          <span style={{ fontSize: 11, color: G.muted }}>
+                            {new Date(t.entry_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                          <span style={{
+                            fontSize: 10, fontWeight: 700,
+                            color: t.status === 'active' ? G.primary : G.muted,
+                          }}>
+                            {t.status === 'active' ? '● Parked' : '✓ Left'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Pie chart column */}
+        <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '18px 16px' }}>
+          <h3 style={{ margin: '0 0 12px', fontSize: 13, fontWeight: 700, color: G.dark }}>📊 Type Distribution</h3>
+          {pieData.length ? (
+            <PieChart data={pieData} />
+          ) : (
+            <p style={{ color: G.muted, fontSize: 13, textAlign: 'center', padding: '40px 0' }}>No vehicles today.</p>
+          )}
+          {/* Type totals mini list */}
+          {total > 0 && (
+            <div style={{ marginTop: 12, borderTop: `1px solid ${G.border}`, paddingTop: 10 }}>
+              {TYPES.filter(t => grouped[t].length > 0).map(t => (
+                <div key={t} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', fontSize: 12 }}>
+                  <span style={{ color: G.muted }}>{VTYPE_ICONS[t]} {t}</span>
+                  <span style={{ fontWeight: 700, color: VTYPE_COLORS[t] }}>{grouped[t].length}</span>
+                </div>
+              ))}
+              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0 0', fontSize: 12, borderTop: `1px solid ${G.border}`, marginTop: 4 }}>
+                <span style={{ fontWeight: 700, color: G.dark }}>Total</span>
+                <span style={{ fontWeight: 800, color: G.dark }}>{total}</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Full vehicles table with search ──────────────────────────── */}
+      <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, overflow: 'hidden' }}>
+        <div style={{ padding: '12px 20px', borderBottom: `1px solid ${G.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: G.dark }}>
+            {filter === 'all'
+              ? `All Vehicles — ${shown.length}`
+              : `${VTYPE_ICONS[filter]} ${filter.charAt(0).toUpperCase() + filter.slice(1)} — ${shown.length} vehicles`}
+          </h3>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search plate / type / slot…"
+              style={{ padding: '6px 12px', borderRadius: 8, border: `1.5px solid ${G.border}`, fontSize: 12, outline: 'none', width: 220 }}
+            />
+            {filter !== 'all' && (
+              <button onClick={() => setFilter('all')} style={{ background: 'none', border: 'none', color: G.muted, cursor: 'pointer', fontSize: 13 }}>
+                ✕ Clear
+              </button>
+            )}
+          </div>
+        </div>
+
+        {shown.length === 0 ? (
+          <p style={{ textAlign: 'center', padding: 40, color: G.muted }}>
+            {tickets.length === 0 ? 'No vehicles recorded today.' : 'No vehicles match.'}
+          </p>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: G.lighter }}>
+                  {['#', 'Type', 'License Plate', 'Entry Time', 'Duration', 'Slot', 'Status', 'Attendant'].map(h => (
+                    <th key={h} style={{ padding: '10px 14px', textAlign: 'left', fontWeight: 700, color: G.dark, fontSize: 12, borderBottom: `1px solid ${G.border}`, whiteSpace: 'nowrap' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((t, i) => {
+                  const hrs  = Math.floor(t.duration_hours);
+                  const mins = Math.floor((t.duration_hours - hrs) * 60);
+                  return (
+                    <tr key={t.id} style={{ borderBottom: `1px solid ${G.border}`, background: i % 2 === 0 ? G.white : G.lighter }}>
+                      <td style={{ padding: '10px 14px', fontWeight: 700, color: G.dark }}>#{t.ticket_number}</td>
+                      <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                        <span style={{ fontSize: 16, marginRight: 6 }}>{VTYPE_ICONS[t.vehicle_type]}</span>
+                        <Badge text={t.vehicle_type} color={VTYPE_COLORS[t.vehicle_type] ?? G.muted} />
+                      </td>
+                      <td style={{ padding: '10px 14px' }}>
+                        {t.license_plate
+                          ? <span style={{ fontFamily: 'monospace', fontWeight: 800, letterSpacing: 1.2, fontSize: 13, background: '#1e293b', color: '#f1f5f9', padding: '3px 10px', borderRadius: 4, display: 'inline-block' }}>{t.license_plate}</span>
+                          : <span style={{ color: G.muted, fontSize: 12 }}>— no plate —</span>
+                        }
+                      </td>
+                      <td style={{ padding: '10px 14px', color: G.muted, whiteSpace: 'nowrap' }}>
+                        {new Date(t.entry_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </td>
+                      <td style={{ padding: '10px 14px', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                        <span style={{ color: hrs >= 8 ? G.red : hrs >= 4 ? G.orange : G.dark }}>
+                          {hrs}h {mins}m
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 14px', fontWeight: 600, color: G.dark }}>{t.slot_number ?? '—'}</td>
+                      <td style={{ padding: '10px 14px' }}>
+                        <Badge
+                          text={t.status === 'active' ? '● Parked' : '✓ Exited'}
+                          color={t.status === 'active' ? G.primary : G.muted}
+                        />
+                      </td>
+                      <td style={{ padding: '10px 14px', color: G.muted, fontSize: 12 }}>{t.attendant_name ?? '—'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 3: MANAGE SLOTS & GATES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function ManageSlotsGatesSection({
+  lots, activeLot, slots, slotTypes, entrances, exits,
+  onSlotCreated, onSlotDeleted, onSlotStatus,
+  onEntranceCreated, onEntranceDeleted, onExitCreated, onExitDeleted,
+  onOpenEntrance, onOpenExit, showToast,
+}: {
+  lots: ParkingLot[]; activeLot: ParkingLot | null;
+  slots: ParkingSlot[]; slotTypes: SlotType[];
+  entrances: Entrance[]; exits: Exit[];
+  onSlotCreated: (s: ParkingSlot) => void; onSlotDeleted: (id: string) => void;
+  onSlotStatus: (id: string, status: string) => void;
+  onEntranceCreated: (e: Entrance) => void; onEntranceDeleted: (id: string) => void;
+  onExitCreated: (e: Exit) => void; onExitDeleted: (id: string) => void;
+  onOpenEntrance: (id: string) => void; onOpenExit: (id: string) => void;
+  showToast: (m: string) => void;
+}) {
+  const [subTab, setSubTab] = useState<'slots' | 'entrances' | 'exits'>('slots');
+
+  // Slot form
+  const [slotNum, setSlotNum]     = useState('');
+  const [slotType, setSlotType]   = useState('');
+  const [sensorId, setSensorId]   = useState('');
+
+  // Entrance form
+  const [entName, setEntName]     = useState('');
+  const [entSensor, setEntSensor] = useState('');
+  const [entCamera, setEntCamera] = useState('');
+
+  // Exit form
+  const [exitName, setExitName]   = useState('');
+  const [exitSensor, setExitSensor] = useState('');
+
+  const statusColor: Record<string, string> = {
+    vacant: G.primary, occupied: G.red, reserved: G.orange, maintenance: G.muted,
+  };
+
+  const handleAddSlot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeLot) return;
+    try {
+      const res = await slotsAPI.create({
+        lot: activeLot.id, slot_number: slotNum,
+        slot_type: Number(slotType) as any, sensor_id: sensorId,
+      });
+      onSlotCreated(res.data);
+      setSlotNum(''); setSensorId('');
+      showToast(`✅ Slot ${slotNum} created.`);
+    } catch { showToast('❌ Failed to create slot.'); }
+  };
+
+  const handleDelSlot = async (id: string, num: string) => {
+    if (!confirm(`Delete slot ${num}?`)) return;
+    try { await slotsAPI.delete(id); onSlotDeleted(id); showToast(`🗑 Slot ${num} deleted.`); }
+    catch { showToast('❌ Delete failed.'); }
+  };
+
+  const handleAddEntrance = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeLot) return;
+    try {
+      const res = await entrancesAPI.create({ lot: activeLot.id, name: entName, sensor_id: entSensor, camera_ip: entCamera });
+      onEntranceCreated(res.data);
+      setEntName(''); setEntSensor(''); setEntCamera('');
+      showToast(`✅ Entrance "${entName}" created.`);
+    } catch { showToast('❌ Failed to create entrance.'); }
+  };
+
+  const handleDelEntrance = async (id: string, name: string) => {
+    if (!confirm(`Delete entrance "${name}"?`)) return;
+    try { await entrancesAPI.delete(id); onEntranceDeleted(id); showToast(`🗑 Entrance deleted.`); }
+    catch { showToast('❌ Delete failed.'); }
+  };
+
+  const handleAddExit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeLot) return;
+    try {
+      const res = await exitsAPI.create({ lot: activeLot.id, name: exitName, sensor_id: exitSensor });
+      onExitCreated(res.data);
+      setExitName(''); setExitSensor('');
+      showToast(`✅ Exit "${exitName}" created.`);
+    } catch { showToast('❌ Failed to create exit.'); }
+  };
+
+  const handleDelExit = async (id: string, name: string) => {
+    if (!confirm(`Delete exit "${name}"?`)) return;
+    try { await exitsAPI.delete(id); onExitDeleted(id); showToast(`🗑 Exit deleted.`); }
+    catch { showToast('❌ Delete failed.'); }
+  };
+
+  const subTabs = [
+    { key: 'slots' as const,     label: `🅿 Parking Slots (${slots.length})` },
+    { key: 'entrances' as const, label: `🚪 Entrances (${entrances.length})` },
+    { key: 'exits' as const,     label: `🚧 Exits (${exits.length})` },
+  ];
+
+  return (
+    <div>
+      <SectionTitle sub="Create, delete and monitor parking slots and gate access points">
+        🏗 Manage Slots &amp; Gates
+      </SectionTitle>
+
+      {/* Sub-tab bar */}
+      <div style={{ display: 'flex', gap: 0, borderBottom: `1.5px solid ${G.border}`, marginBottom: 24 }}>
+        {subTabs.map(t => (
+          <button key={t.key} onClick={() => setSubTab(t.key)} style={{
+            padding: '10px 18px', border: 'none', background: 'transparent',
+            cursor: 'pointer', fontSize: 13, fontWeight: subTab === t.key ? 700 : 500,
+            color: subTab === t.key ? G.primary : G.muted,
+            borderBottom: subTab === t.key ? `3px solid ${G.primary}` : '3px solid transparent',
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* ── SLOTS ── */}
+      {subTab === 'slots' && (
+        <div>
+          {/* Status legend */}
+          <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
+            {Object.entries(statusColor).map(([st, col]) => (
+              <div key={st} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: G.muted }}>
+                <span style={{ width: 12, height: 12, borderRadius: 3, background: col }} />
+                {st.charAt(0).toUpperCase() + st.slice(1)}
+              </div>
+            ))}
+          </div>
+
+          {/* Slot grid */}
+          {slots.length === 0 ? (
+            <p style={{ color: G.muted, textAlign: 'center', padding: 32 }}>No slots configured. Add one below.</p>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(90px, 1fr))', gap: 8, marginBottom: 24 }}>
+              {slots.map(slot => (
+                <div key={slot.id} style={{ position: 'relative', textAlign: 'center' }}>
+                  <button
+                    title={`Slot ${slot.slot_number} — ${slot.status}`}
+                    onClick={() => {
+                      const next = slot.status === 'vacant' ? 'maintenance' : 'vacant';
+                      onSlotStatus(slot.id, next);
+                    }}
+                    style={{
+                      width: '100%', padding: '10px 4px', borderRadius: 8, border: 'none',
+                      background: statusColor[slot.status] ?? G.muted, color: G.white,
+                      fontWeight: 700, fontSize: 12, cursor: 'pointer',
+                    }}>
+                    {slot.slot_number}
+                  </button>
+                  <button
+                    onClick={() => handleDelSlot(slot.id, slot.slot_number)}
+                    title="Delete slot"
+                    style={{
+                      position: 'absolute', top: -6, right: -6,
+                      width: 18, height: 18, borderRadius: '50%',
+                      background: G.red, color: G.white, border: 'none',
+                      cursor: 'pointer', fontSize: 10, fontWeight: 700, lineHeight: '18px',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Add slot form */}
+          <div style={{ background: G.lighter, border: `1.5px solid ${G.border}`, borderRadius: 12, padding: '20px 24px' }}>
+            <h3 style={{ margin: '0 0 14px', fontSize: 14, fontWeight: 700, color: G.dark }}>+ Add New Parking Slot</h3>
+            <form onSubmit={handleAddSlot} style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div>
+                <label style={fS.label}>Slot Number</label>
+                <input style={fS.input} placeholder="e.g. A1" value={slotNum}
+                  onChange={e => setSlotNum(e.target.value)} required />
+              </div>
+              <div>
+                <label style={fS.label}>Slot Type</label>
+                <select style={fS.input} value={slotType} onChange={e => setSlotType(e.target.value)} required>
+                  <option value="">Select type</option>
+                  {slotTypes.map(st => <option key={st.id} value={st.id}>{st.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={fS.label}>Sensor ID (optional)</label>
+                <input style={fS.input} placeholder="Firebase key" value={sensorId}
+                  onChange={e => setSensorId(e.target.value)} />
+              </div>
+              <button type="submit" style={fS.btn}>+ Add Slot</button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── ENTRANCES ── */}
+      {subTab === 'entrances' && (
+        <div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14, marginBottom: 24 }}>
+            {entrances.length === 0 && (
+              <p style={{ color: G.muted, gridColumn: '1/-1', textAlign: 'center', padding: 32 }}>No entrances configured.</p>
+            )}
+            {entrances.map(en => (
+              <div key={en.id} style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 12, padding: '16px 18px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                  <div>
+                    <p style={{ margin: 0, fontWeight: 700, color: G.dark, fontSize: 15 }}>🚪 {en.name}</p>
+                    <p style={{ margin: '4px 0 0', fontSize: 12, color: G.muted }}>
+                      Sensor: {en.sensor_id} {en.camera_ip ? `| Cam: ${en.camera_ip}` : ''}
+                    </p>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <Badge text={en.is_active ? 'Active' : 'Inactive'} color={en.is_active ? G.primary : G.muted} />
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={() => onOpenEntrance(en.id)} style={{ ...fS.btn, flex: 1, padding: '9px 8px', fontSize: 13 }}>
+                    🔓 Open Gate
+                  </button>
+                  <button onClick={() => handleDelEntrance(en.id, en.name)} style={{
+                    padding: '9px 14px', background: '#fef2f2', color: G.red,
+                    border: `1.5px solid #fecaca`, borderRadius: 8, cursor: 'pointer', fontWeight: 700, fontSize: 13,
+                  }}>🗑</button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ background: G.lighter, border: `1.5px solid ${G.border}`, borderRadius: 12, padding: '20px 24px' }}>
+            <h3 style={{ margin: '0 0 14px', fontSize: 14, fontWeight: 700, color: G.dark }}>+ Add New Entrance Gate</h3>
+            <form onSubmit={handleAddEntrance} style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div>
+                <label style={fS.label}>Gate Name</label>
+                <input style={fS.input} placeholder="e.g. Main Entrance" value={entName}
+                  onChange={e => setEntName(e.target.value)} required />
+              </div>
+              <div>
+                <label style={fS.label}>Sensor ID</label>
+                <input style={fS.input} placeholder="Firebase sensor key" value={entSensor}
+                  onChange={e => setEntSensor(e.target.value)} required />
+              </div>
+              <div>
+                <label style={fS.label}>Camera IP (optional)</label>
+                <input style={fS.input} placeholder="192.168.x.x" value={entCamera}
+                  onChange={e => setEntCamera(e.target.value)} />
+              </div>
+              <button type="submit" style={fS.btn}>+ Add Entrance</button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── EXITS ── */}
+      {subTab === 'exits' && (
+        <div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14, marginBottom: 24 }}>
+            {exits.length === 0 && (
+              <p style={{ color: G.muted, gridColumn: '1/-1', textAlign: 'center', padding: 32 }}>No exits configured.</p>
+            )}
+            {exits.map(ex => (
+              <div key={ex.id} style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 12, padding: '16px 18px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                  <div>
+                    <p style={{ margin: 0, fontWeight: 700, color: G.dark, fontSize: 15 }}>🚧 {ex.name}</p>
+                    <p style={{ margin: '4px 0 0', fontSize: 12, color: G.muted }}>Sensor: {ex.sensor_id}</p>
+                  </div>
+                  <Badge text={ex.is_active ? 'Active' : 'Inactive'} color={ex.is_active ? G.primary : G.muted} />
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={() => onOpenExit(ex.id)} style={{ ...fS.btn, flex: 1, padding: '9px 8px', fontSize: 13, background: G.orange }}>
+                    🔓 Open Gate
+                  </button>
+                  <button onClick={() => handleDelExit(ex.id, ex.name)} style={{
+                    padding: '9px 14px', background: '#fef2f2', color: G.red,
+                    border: `1.5px solid #fecaca`, borderRadius: 8, cursor: 'pointer', fontWeight: 700, fontSize: 13,
+                  }}>🗑</button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ background: G.lighter, border: `1.5px solid ${G.border}`, borderRadius: 12, padding: '20px 24px' }}>
+            <h3 style={{ margin: '0 0 14px', fontSize: 14, fontWeight: 700, color: G.dark }}>+ Add New Exit Gate</h3>
+            <form onSubmit={handleAddExit} style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div>
+                <label style={fS.label}>Gate Name</label>
+                <input style={fS.input} placeholder="e.g. Back Exit" value={exitName}
+                  onChange={e => setExitName(e.target.value)} required />
+              </div>
+              <div>
+                <label style={fS.label}>Sensor ID</label>
+                <input style={fS.input} placeholder="Firebase sensor key" value={exitSensor}
+                  onChange={e => setExitSensor(e.target.value)} required />
+              </div>
+              <button type="submit" style={{ ...fS.btn, background: G.orange }}>+ Add Exit</button>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 4: VEHICLES PARKED
+// ═══════════════════════════════════════════════════════════════════════════
+
+function VehiclesParkedSection({ tickets, onRefresh }: {
+  tickets: Ticket[];
+  onRefresh: () => void;
+}) {
+  const [subTab, setSubTab] = useState<'active' | 'exited'>('active');
+  const active  = tickets.filter(t => t.status === 'active');
+  const exited  = tickets.filter(t => t.status !== 'active');
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <SectionTitle sub={`${active.length} currently parked · ${exited.length} exited today`}>
+          🚙 Vehicles Parked
+        </SectionTitle>
+        <button onClick={onRefresh} style={{ ...fS.btn, background: 'transparent', color: G.primary, border: `1.5px solid ${G.primary}` }}>
+          ↻ Refresh
+        </button>
+      </div>
+
+      {/* Sub tabs */}
+      <div style={{ display: 'flex', gap: 0, borderBottom: `1.5px solid ${G.border}`, marginBottom: 20 }}>
+        {[
+          { key: 'active' as const, label: `🟢 Currently Parked (${active.length})` },
+          { key: 'exited' as const, label: `🚪 Exited Today (${exited.length})` },
+        ].map(t => (
+          <button key={t.key} onClick={() => setSubTab(t.key)} style={{
+            padding: '10px 18px', border: 'none', background: 'transparent',
+            cursor: 'pointer', fontSize: 13, fontWeight: subTab === t.key ? 700 : 500,
+            color: subTab === t.key ? G.primary : G.muted,
+            borderBottom: subTab === t.key ? `3px solid ${G.primary}` : '3px solid transparent',
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* Active Vehicles Table */}
+      {subTab === 'active' && (
+        <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, overflow: 'hidden' }}>
+          {active.length === 0 ? (
+            <p style={{ textAlign: 'center', padding: 40, color: G.muted }}>🏁 No vehicles currently parked.</p>
+          ) : (
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ background: G.lighter }}>
+                    {['Ticket #', 'Type', 'License Plate', 'Slot', 'Entry Time', 'Hours Spent', 'Fee (UGX)', 'Parked By'].map(h => (
+                      <th key={h} style={{ padding: '10px 14px', textAlign: 'left', fontWeight: 700, color: G.dark, fontSize: 12, borderBottom: `1px solid ${G.border}` }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {active.map((t, i) => {
+                    const hrs  = Math.floor(t.duration_hours);
+                    const mins = Math.floor((t.duration_hours - hrs) * 60);
+                    return (
+                      <tr key={t.id} style={{ borderBottom: `1px solid ${G.border}`, background: i % 2 === 0 ? G.white : G.lighter }}>
+                        <td style={{ padding: '10px 14px', fontWeight: 700, color: G.dark }}>#{t.ticket_number}</td>
+                        <td style={{ padding: '10px 14px' }}>
+                          {VTYPE_ICONS[t.vehicle_type]} {t.vehicle_type}
+                        </td>
+                        <td style={{ padding: '10px 14px', fontFamily: 'monospace', fontWeight: 700, letterSpacing: 1.5 }}>
+                          {t.license_plate || '—'}
+                        </td>
+                        <td style={{ padding: '10px 14px', fontWeight: 600 }}>{t.slot_number ?? '—'}</td>
+                        <td style={{ padding: '10px 14px', color: G.muted }}>
+                          {new Date(t.entry_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </td>
+                        <td style={{ padding: '10px 14px', fontWeight: 600, color: G.orange }}>{hrs}h {mins}m</td>
+                        <td style={{ padding: '10px 14px', fontWeight: 700, color: G.primary }}>
+                          {t.calculated_fee.toLocaleString()}
+                        </td>
+                        <td style={{ padding: '10px 14px', color: G.muted }}>{t.attendant_name ?? '—'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Exited Vehicles Table */}
+      {subTab === 'exited' && (
+        <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, overflow: 'hidden' }}>
+          {exited.length === 0 ? (
+            <p style={{ textAlign: 'center', padding: 40, color: G.muted }}>No vehicles have exited today.</p>
+          ) : (
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ background: G.lighter }}>
+                    {['Ticket #', 'Type', 'License Plate', 'Entry', 'Exit', 'Duration', 'Paid (UGX)', 'Method', 'Processed By'].map(h => (
+                      <th key={h} style={{ padding: '10px 14px', textAlign: 'left', fontWeight: 700, color: G.dark, fontSize: 12, borderBottom: `1px solid ${G.border}` }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {exited.map((t, i) => {
+                    const hrs  = Math.floor(t.duration_hours);
+                    const mins = Math.floor((t.duration_hours - hrs) * 60);
+                    return (
+                      <tr key={t.id} style={{ borderBottom: `1px solid ${G.border}`, background: i % 2 === 0 ? G.white : G.lighter }}>
+                        <td style={{ padding: '10px 14px', fontWeight: 700, color: G.dark }}>#{t.ticket_number}</td>
+                        <td style={{ padding: '10px 14px' }}>{VTYPE_ICONS[t.vehicle_type]} {t.vehicle_type}</td>
+                        <td style={{ padding: '10px 14px', fontFamily: 'monospace', fontWeight: 700, letterSpacing: 1.5 }}>
+                          {t.license_plate || '—'}
+                        </td>
+                        <td style={{ padding: '10px 14px', color: G.muted }}>
+                          {new Date(t.entry_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </td>
+                        <td style={{ padding: '10px 14px', color: G.muted }}>
+                          {t.exit_time ? new Date(t.exit_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
+                        </td>
+                        <td style={{ padding: '10px 14px', fontWeight: 600 }}>{hrs}h {mins}m</td>
+                        <td style={{ padding: '10px 14px', fontWeight: 700, color: G.blue }}>
+                          {Number(t.amount_charged).toLocaleString()}
+                        </td>
+                        <td style={{ padding: '10px 14px' }}>
+                          {t.is_service_exempt ? (
+                            <Badge text="Exempt" color={G.orange} />
+                          ) : (
+                            <Badge text={t.payment_method || '—'} color={G.blue} />
+                          )}
+                        </td>
+                        <td style={{ padding: '10px 14px', color: G.muted }}>{t.attendant_name ?? '—'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 5: ATTENDANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function AttendantsSection({
+  attendants, lots, entrances, exits,
+  onCreated, onDeleted, onOpenGate, showToast,
+}: {
+  attendants: User[]; lots: ParkingLot[];
+  entrances: Entrance[]; exits: Exit[];
+  onCreated: (u: User) => void; onDeleted: (id: string) => void;
+  onOpenGate: (type: 'entrance' | 'exit', id: string) => void;
+  showToast: (m: string) => void;
+}) {
+  const [subTab, setSubTab] = useState<'entrance' | 'exit' | 'parking'>('entrance');
+  const [showForm, setShowForm] = useState(false);
+
+  // Form fields
+  const [fFirst, setFFirst]     = useState('');
+  const [fLast,  setFLast]      = useState('');
+  const [fUser,  setFUser]      = useState('');
+  const [fEmail, setFEmail]     = useState('');
+  const [fPhone, setFPhone]     = useState('');
+  const [fPass,  setFPass]      = useState('');
+  const [fCategory, setFCategory] = useState<'entrance' | 'exit' | 'parking'>('entrance');
+  const [fLot,   setFLot]       = useState('');
+  const [fGate,  setFGate]      = useState('');
+  const [saving, setSaving]     = useState(false);
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      const res = await usersAPI.create({
+        first_name: fFirst, last_name: fLast, username: fUser,
+        email: fEmail, phone: fPhone, password: fPass,
+        role: fCategory === 'entrance' ? 'entrance_attendant'
+            : fCategory === 'exit'     ? 'exit_attendant'
+            :                            'attendant',
+        is_active: true,
+      } as any);
+      onCreated(res.data);
+
+      // Create assignment if gate selected
+      if (fLot && fGate) {
+        try {
+          await assignmentsAPI.create({
+            attendant: res.data.id, lot: fLot,
+            entrance:  fCategory === 'entrance' ? fGate : undefined,
+            exit_gate: fCategory === 'exit' ? fGate : undefined,
+            is_active: true,
+          } as any);
+        } catch { /* assignment creation is optional */ }
+      }
+
+      showToast(`✅ Attendant ${fFirst} ${fLast} created.`);
+      setFFirst(''); setFLast(''); setFUser(''); setFEmail('');
+      setFPhone(''); setFPass(''); setFLot(''); setFGate('');
+      setShowForm(false);
+    } catch (err: any) {
+      showToast(`❌ ${err?.response?.data?.username?.[0] ?? 'Creation failed.'}`);
+    } finally { setSaving(false); }
+  };
+
+  const handleDelete = async (id: string, name: string) => {
+    if (!confirm(`Remove attendant "${name}"?`)) return;
+    try {
+      await usersAPI.delete(id);
+      onDeleted(id);
+      showToast(`🗑 Attendant removed.`);
+    } catch { showToast('❌ Delete failed.'); }
+  };
+
+  const categoryMap: Record<string, string> = {
+    entrance: 'Entrance Attendant',
+    exit:     'Exit Attendant',
+    parking:  'Parking Attendant',
+  };
+
+  // Derive category from gate assignment — for now show all attendants under each sub-tab
+  // (A real implementation would filter by assignment type; here we show all for simplicity)
+  const shown = attendants;
+
+  const gateOptions = subTab === 'entrance'
+    ? entrances.map(e => ({ id: e.id, label: e.name }))
+    : exits.map(e => ({ id: e.id, label: e.name }));
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <SectionTitle sub="Create and manage parking staff accounts with gate access rights">
+          👷 Attendants
+        </SectionTitle>
+        <button onClick={() => setShowForm(!showForm)} style={fS.btn}>
+          {showForm ? '✕ Cancel' : '+ Create Attendant'}
+        </button>
+      </div>
+
+      {/* Attendant category sub-tabs */}
+      <div style={{ display: 'flex', gap: 0, borderBottom: `1.5px solid ${G.border}`, marginBottom: 24 }}>
+        {([
+          { key: 'entrance', label: '🚪 Entrance Attendants' },
+          { key: 'exit',     label: '🚧 Exit Attendants' },
+          { key: 'parking',  label: '🅿 Parking Attendants' },
+        ] as const).map(t => (
+          <button key={t.key} onClick={() => setSubTab(t.key)} style={{
+            padding: '10px 18px', border: 'none', background: 'transparent',
+            cursor: 'pointer', fontSize: 13, fontWeight: subTab === t.key ? 700 : 500,
+            color: subTab === t.key ? G.primary : G.muted,
+            borderBottom: subTab === t.key ? `3px solid ${G.primary}` : '3px solid transparent',
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* Attendant category descriptions */}
+      <div style={{ background: G.lighter, border: `1.5px solid ${G.border}`, borderRadius: 10, padding: '12px 16px', marginBottom: 24, fontSize: 13, color: G.dark }}>
+        {subTab === 'entrance' && (
+          <p style={{ margin: 0 }}>
+            <strong>Entrance Attendants</strong> operate at entry gates. They scan incoming vehicles, issue tickets/receipts, and open the entrance gate to allow vehicles in. The system auto-captures license plates and assigns parking slots.
+          </p>
+        )}
+        {subTab === 'exit' && (
+          <p style={{ margin: 0 }}>
+            <strong>Exit Attendants</strong> operate at exit gates. They scan exit receipts, the system displays hours spent and calculates the amount due, the attendant collects payment, and the system opens the exit gate after confirming payment.
+          </p>
+        )}
+        {subTab === 'parking' && (
+          <p style={{ margin: 0 }}>
+            <strong>Parking Attendants</strong> assist clients in parking their vehicles within the lot. They record the vehicles they have helped park using the system and guide drivers to assigned slots.
+          </p>
+        )}
+      </div>
+
+      {/* Create Attendant Form */}
+      {showForm && (
+        <div style={{ background: G.lighter, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '24px', marginBottom: 24 }}>
+          <h3 style={{ margin: '0 0 18px', fontSize: 15, fontWeight: 700, color: G.dark }}>
+            New Attendant Account
+          </h3>
+          <form onSubmit={handleCreate}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12, marginBottom: 14 }}>
+              <div>
+                <label style={fS.label}>First Name *</label>
+                <input style={fS.input} value={fFirst} onChange={e => setFFirst(e.target.value)} placeholder="First name" required />
+              </div>
+              <div>
+                <label style={fS.label}>Last Name *</label>
+                <input style={fS.input} value={fLast} onChange={e => setFLast(e.target.value)} placeholder="Last name" required />
+              </div>
+              <div>
+                <label style={fS.label}>Username *</label>
+                <input style={fS.input} value={fUser} onChange={e => setFUser(e.target.value)} placeholder="Login username" required />
+              </div>
+              <div>
+                <label style={fS.label}>Email</label>
+                <input style={fS.input} type="email" value={fEmail} onChange={e => setFEmail(e.target.value)} placeholder="email@iuiu.ac.ug" />
+              </div>
+              <div>
+                <label style={fS.label}>Phone</label>
+                <input style={fS.input} value={fPhone} onChange={e => setFPhone(e.target.value)} placeholder="+256 7xx xxx xxx" />
+              </div>
+              <div>
+                <label style={fS.label}>Password *</label>
+                <input style={fS.input} type="password" value={fPass} onChange={e => setFPass(e.target.value)} placeholder="Min 8 characters" minLength={8} required />
+              </div>
+              <div>
+                <label style={fS.label}>Category *</label>
+                <select style={fS.input} value={fCategory} onChange={e => setFCategory(e.target.value as any)}>
+                  <option value="entrance">Entrance Attendant</option>
+                  <option value="exit">Exit Attendant</option>
+                  <option value="parking">Parking Attendant</option>
+                </select>
+              </div>
+              {fCategory !== 'parking' && (
+                <>
+                  <div>
+                    <label style={fS.label}>Assign to Lot</label>
+                    <select style={fS.input} value={fLot} onChange={e => setFLot(e.target.value)}>
+                      <option value="">No assignment</option>
+                      {lots.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+                    </select>
+                  </div>
+                  {fLot && (
+                    <div>
+                      <label style={fS.label}>Assign Gate</label>
+                      <select style={fS.input} value={fGate} onChange={e => setFGate(e.target.value)}>
+                        <option value="">No gate</option>
+                        {(fCategory === 'entrance' ? entrances : exits)
+                          .filter(g => g.lot === fLot)
+                          .map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+                      </select>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+            <button type="submit" style={fS.btn} disabled={saving}>
+              {saving ? 'Creating…' : '✅ Create Attendant'}
+            </button>
+          </form>
+        </div>
+      )}
+
+      {/* Attendant Cards */}
+      {shown.length === 0 ? (
+        <p style={{ textAlign: 'center', padding: 40, color: G.muted }}>No attendants created yet.</p>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 }}>
+          {shown.map(att => (
+            <div key={att.id} style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '18px 20px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{
+                    width: 44, height: 44, borderRadius: '50%',
+                    background: `linear-gradient(135deg, ${G.primary}, ${G.dark})`,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    color: G.white, fontWeight: 800, fontSize: 16,
+                  }}>
+                    {att.first_name?.[0]?.toUpperCase() ?? '?'}{att.last_name?.[0]?.toUpperCase() ?? ''}
+                  </div>
+                  <div>
+                    <p style={{ margin: 0, fontWeight: 700, color: G.dark, fontSize: 15 }}>
+                      {att.first_name} {att.last_name}
+                    </p>
+                    <p style={{ margin: '2px 0 0', fontSize: 12, color: G.muted }}>@{att.username}</p>
+                  </div>
+                </div>
+                <Badge text={att.is_active ? 'Active' : 'Inactive'} color={att.is_active ? G.primary : G.muted} />
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: G.muted, marginBottom: 14 }}>
+                {att.email && <span>✉ {att.email}</span>}
+                {att.phone && <span>📞 {att.phone}</span>}
+                <span>🏷 Role: {att.role}</span>
+              </div>
+
+              {/* Gate control buttons for this attendant */}
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+                {subTab !== 'parking' && entrances.slice(0, 2).map(en => (
+                  <button key={en.id}
+                    onClick={() => onOpenGate('entrance', en.id)}
+                    style={{ padding: '7px 12px', background: G.light, color: G.dark, border: `1.5px solid ${G.border}`, borderRadius: 8, cursor: 'pointer', fontWeight: 700, fontSize: 12 }}>
+                    🚪 {en.name}
+                  </button>
+                ))}
+                {subTab === 'exit' && exits.slice(0, 2).map(ex => (
+                  <button key={ex.id}
+                    onClick={() => onOpenGate('exit', ex.id)}
+                    style={{ padding: '7px 12px', background: '#fef9c3', color: '#854d0e', border: `1.5px solid #fde68a`, borderRadius: 8, cursor: 'pointer', fontWeight: 700, fontSize: 12 }}>
+                    🚧 {ex.name}
+                  </button>
+                ))}
+              </div>
+
+              <button onClick={() => handleDelete(att.id, `${att.first_name} ${att.last_name}`)} style={{
+                width: '100%', padding: '8px', background: '#fef2f2', color: G.red,
+                border: `1.5px solid #fecaca`, borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontSize: 12,
+              }}>
+                🗑 Remove Attendant
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 6: PRICING
+// ═══════════════════════════════════════════════════════════════════════════
+
+function PricingSection({
+  slotTypes, lots, onUpdated, onLotFeeUpdated, showToast,
+}: {
+  slotTypes: SlotType[]; lots: ParkingLot[];
+  onUpdated: (st: SlotType) => void;
+  onLotFeeUpdated: (lot: ParkingLot) => void;
+  showToast: (m: string) => void;
+}) {
+  const [editing, setEditing] = useState<Record<number, Partial<SlotType>>>({});
+  const [newName,  setNewName]  = useState('');
+  const [newClass, setNewClass] = useState<'car'|'truck'|'cycle'>('car');
+  const [newRate,  setNewRate]  = useState('');
+  const [newMax,   setNewMax]   = useState('');
+  const [newGrace, setNewGrace] = useState('10');
+  const [newColor, setNewColor] = useState('#16a34a');
+
+  const setField = (id: number, field: keyof SlotType, value: string) => {
+    setEditing(prev => ({ ...prev, [id]: { ...prev[id], [field]: value } }));
+  };
+
+  const handleSave = async (st: SlotType) => {
+    const patch = editing[st.id];
+    if (!patch) return;
+    try {
+      const { slotTypesAPI } = await import('../api/client');
+      const res = await slotTypesAPI.update(st.id, patch);
+      onUpdated(res.data);
+      setEditing(prev => { const n = {...prev}; delete n[st.id]; return n; });
+      showToast(`✅ Pricing updated for ${st.name}.`);
+    } catch { showToast('❌ Update failed.'); }
+  };
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const { slotTypesAPI } = await import('../api/client');
+      const res = await slotTypesAPI.create({
+        name: newName, vehicle_class: newClass,
+        hourly_rate: Number(newRate),
+        daily_max_rate: newMax ? Number(newMax) : null,
+        grace_period_minutes: Number(newGrace),
+        color_hex: newColor, description: '',
+      } as any);
+      onUpdated(res.data);
+      setNewName(''); setNewRate(''); setNewMax(''); setNewGrace('10');
+      showToast(`✅ Price category "${newName}" created.`);
+    } catch { showToast('❌ Create failed (class may already exist).'); }
+  };
+
+  const vehicleClassIcons: Record<string, string> = { car: '🚗', truck: '🚛', cycle: '🏍' };
+
+  return (
+    <div>
+      <SectionTitle sub="Set hourly parking rates for each vehicle category">
+        💰 Pricing
+      </SectionTitle>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginBottom: 32 }}>
+        {slotTypes.map(st => {
+          const e = editing[st.id] ?? {};
+          const dirty = Object.keys(e).length > 0;
+          return (
+            <div key={st.id} style={{
+              background: G.white, border: `2px solid ${dirty ? G.primary : G.border}`,
+              borderRadius: 14, padding: '20px 24px',
+              borderLeft: `6px solid ${st.color_hex}`,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ fontSize: 28 }}>{vehicleClassIcons[st.vehicle_class]}</span>
+                  <div>
+                    <p style={{ margin: 0, fontWeight: 800, fontSize: 16, color: G.dark }}>{st.name}</p>
+                    <p style={{ margin: '2px 0 0', fontSize: 12, color: G.muted }}>
+                      Class: {st.vehicle_class} · Current: UGX {Number(st.hourly_rate).toLocaleString()}/hr
+                    </p>
+                  </div>
+                </div>
+                {dirty && (
+                  <button onClick={() => handleSave(st)} style={fS.btn}>
+                    💾 Save Changes
+                  </button>
+                )}
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 14 }}>
+                <div>
+                  <label style={fS.label}>Hourly Rate (UGX)</label>
+                  <input style={fS.input} type="number" min={0}
+                    defaultValue={st.hourly_rate}
+                    onChange={e => setField(st.id, 'hourly_rate', e.target.value)}
+                    placeholder="e.g. 2000" />
+                </div>
+                <div>
+                  <label style={fS.label}>Daily Max (UGX) — optional</label>
+                  <input style={fS.input} type="number" min={0}
+                    defaultValue={st.daily_max_rate ?? ''}
+                    onChange={e => setField(st.id, 'daily_max_rate', e.target.value)}
+                    placeholder="No cap" />
+                </div>
+                <div>
+                  <label style={fS.label}>Grace Period (minutes)</label>
+                  <input style={fS.input} type="number" min={0}
+                    defaultValue={st.grace_period_minutes}
+                    onChange={e => setField(st.id, 'grace_period_minutes', e.target.value)}
+                    placeholder="e.g. 10" />
+                </div>
+                <div>
+                  <label style={fS.label}>Badge Colour</label>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <input type="color" value={e.color_hex ?? st.color_hex}
+                      onChange={ev => setField(st.id, 'color_hex', ev.target.value)}
+                      style={{ width: 40, height: 38, border: 'none', cursor: 'pointer', borderRadius: 6 }} />
+                    <span style={{ fontSize: 12, color: G.muted }}>{e.color_hex ?? st.color_hex}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Fee calculator preview */}
+              <div style={{ marginTop: 14, background: G.lighter, borderRadius: 8, padding: '10px 14px', fontSize: 12, color: G.dark }}>
+                💡 At UGX {Number(e.hourly_rate ?? st.hourly_rate).toLocaleString()}/hr:
+                1h = <strong>UGX {Number(e.hourly_rate ?? st.hourly_rate).toLocaleString()}</strong> ·
+                3h = <strong>UGX {(Number(e.hourly_rate ?? st.hourly_rate) * 3).toLocaleString()}</strong> ·
+                8h = <strong>UGX {(Number(e.hourly_rate ?? st.hourly_rate) * 8).toLocaleString()}</strong>
+                {(e.daily_max_rate ?? st.daily_max_rate) && (
+                  <> · Cap: <strong>UGX {Number(e.daily_max_rate ?? st.daily_max_rate).toLocaleString()}</strong></>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Create new price category */}
+      <div style={{ background: G.lighter, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '20px 24px' }}>
+        <h3 style={{ margin: '0 0 16px', fontSize: 14, fontWeight: 700, color: G.dark }}>+ Add New Vehicle Price Category</h3>
+        <form onSubmit={handleCreate} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12, alignItems: 'flex-end' }}>
+          <div>
+            <label style={fS.label}>Category Name *</label>
+            <input style={fS.input} value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Standard Car" required />
+          </div>
+          <div>
+            <label style={fS.label}>Vehicle Class *</label>
+            <select style={fS.input} value={newClass} onChange={e => setNewClass(e.target.value as any)}>
+              <option value="car">Car</option>
+              <option value="truck">Truck / Van</option>
+              <option value="cycle">Motorcycle / Cycle</option>
+            </select>
+          </div>
+          <div>
+            <label style={fS.label}>Hourly Rate (UGX) *</label>
+            <input style={fS.input} type="number" min={0} value={newRate} onChange={e => setNewRate(e.target.value)} placeholder="2000" required />
+          </div>
+          <div>
+            <label style={fS.label}>Daily Max (UGX)</label>
+            <input style={fS.input} type="number" min={0} value={newMax} onChange={e => setNewMax(e.target.value)} placeholder="No cap" />
+          </div>
+          <div>
+            <label style={fS.label}>Grace Period (min)</label>
+            <input style={fS.input} type="number" min={0} value={newGrace} onChange={e => setNewGrace(e.target.value)} placeholder="10" />
+          </div>
+          <div>
+            <label style={fS.label}>Badge Colour</label>
+            <input type="color" value={newColor} onChange={e => setNewColor(e.target.value)}
+              style={{ width: 48, height: 38, border: 'none', cursor: 'pointer', borderRadius: 6 }} />
+          </div>
+          <button type="submit" style={fS.btn}>+ Create</button>
+        </form>
+      </div>
+
+      {/* ── Special Fees (lost receipt / no plate) ── */}
+      <SpecialFeesCard lots={lots} onLotFeeUpdated={onLotFeeUpdated} showToast={showToast} />
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPECIAL FEES CARD — lost receipt fee & no-plate fee per lot
+// ─────────────────────────────────────────────────────────────────────────────
+
+function SpecialFeesCard({
+  lots, onLotFeeUpdated, showToast,
+}: {
+  lots: ParkingLot[];
+  onLotFeeUpdated: (lot: ParkingLot) => void;
+  showToast: (m: string) => void;
+}) {
+  const [selectedLotId, setSelectedLotId] = useState(lots[0]?.id ?? '');
+  const [lostFee,      setLostFee]      = useState('');
+  const [noPlateFee,   setNoPlateFee]   = useState('');
+  const [lostTicketFee, setLostTicketFee] = useState('');
+  const [saving,       setSaving]       = useState(false);
+
+  const lot = lots.find(l => l.id === selectedLotId) ?? lots[0];
+
+  // sync inputs when lot changes
+  useEffect(() => {
+    if (lot) {
+      setLostFee(String(lot.lost_receipt_fee ?? 5000));
+      setNoPlateFee(String(lot.no_plate_fee ?? 10000));
+      setLostTicketFee(String(lot.lost_ticket_fee ?? 15000));
+    }
+  }, [lot?.id]);
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!lot) return;
+    setSaving(true);
+    try {
+      const res = await lotsAPI.update(lot.id, {
+        lost_receipt_fee:  Number(lostFee),
+        no_plate_fee:      Number(noPlateFee),
+        lost_ticket_fee:   Number(lostTicketFee),
+      } as any);
+      onLotFeeUpdated(res.data);
+      showToast(`✅ Special fees updated for ${lot.name}.`);
+    } catch { showToast('❌ Update failed.'); }
+    finally   { setSaving(false); }
+  };
+
+  if (!lots.length) return null;
+
+  return (
+    <div style={{ marginTop: 28 }}>
+      <h3 style={{ margin: '0 0 16px', fontSize: 16, fontWeight: 800, color: G.dark }}>
+        🎟 Special Fees — Lost Ticket, Lost Receipt &amp; No Plate
+      </h3>
+      <p style={{ margin: '0 0 16px', fontSize: 13, color: G.muted }}>
+        These fees are charged by the exit attendant for special exit scenarios. Set per parking lot.
+      </p>
+
+      <div style={{ background: G.white, border: `1.5px solid ${G.border}`, borderRadius: 14, padding: '20px 24px' }}>
+        {lots.length > 1 && (
+          <div style={{ marginBottom: 16 }}>
+            <label style={fS.label}>Parking Lot</label>
+            <select style={fS.input} value={selectedLotId} onChange={e => setSelectedLotId(e.target.value)}>
+              {lots.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+            </select>
+          </div>
+        )}
+
+        {/* Fee scenario guide */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 20 }}>
+          {[
+            { icon: '🎫', color: '#2563eb', title: 'Lost Receipt', desc: 'Client has record in system (found by plate) but lost the paper receipt → surcharge added on top of hourly fee' },
+            { icon: '🎟', color: '#dc2626', title: 'Lost Ticket (unrecoverable)', desc: 'Client lost ticket and cannot be traced in the system at all (no record, no plate) → flat penalty fee' },
+            { icon: '🔍', color: '#d97706', title: 'No Plate / No Ticket', desc: 'Vehicle cannot be identified by plate number and has no traceable ticket → flat rate fee' },
+          ].map(({ icon, color, title, desc }) => (
+            <div key={title} style={{ background: `${color}08`, border: `1.5px solid ${color}25`, borderLeft: `4px solid ${color}`, borderRadius: 10, padding: '12px 14px' }}>
+              <p style={{ margin: '0 0 4px', fontWeight: 800, fontSize: 13, color }}>{icon} {title}</p>
+              <p style={{ margin: 0, fontSize: 11, color: G.muted, lineHeight: 1.5 }}>{desc}</p>
+            </div>
+          ))}
+        </div>
+
+        <form onSubmit={handleSave}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 16 }}>
+            <div>
+              <label style={fS.label}>🎫 Lost Receipt Fee (UGX) — surcharge</label>
+              <p style={{ margin: '0 0 6px', fontSize: 11, color: G.muted }}>
+                Added on top of hourly fee when client cannot produce their receipt but record is found by plate.
+              </p>
+              <input style={{ ...fS.input, fontSize: 16, fontWeight: 700 }}
+                type="number" min={0} value={lostFee}
+                onChange={e => setLostFee(e.target.value)}
+                placeholder="e.g. 5000" required />
+              <p style={{ margin: '4px 0 0', fontSize: 11, color: G.muted }}>
+                Current: <strong>UGX {Number(lot?.lost_receipt_fee ?? 0).toLocaleString()}</strong>
+              </p>
+            </div>
+
+            <div>
+              <label style={fS.label}>🎟 Lost Ticket Fee (UGX) — flat rate</label>
+              <p style={{ margin: '0 0 6px', fontSize: 11, color: G.muted }}>
+                Flat fee when a client's ticket is completely lost and cannot be recovered in the system at all.
+              </p>
+              <input style={{ ...fS.input, fontSize: 16, fontWeight: 700 }}
+                type="number" min={0} value={lostTicketFee}
+                onChange={e => setLostTicketFee(e.target.value)}
+                placeholder="e.g. 15000" required />
+              <p style={{ margin: '4px 0 0', fontSize: 11, color: G.muted }}>
+                Current: <strong>UGX {Number(lot?.lost_ticket_fee ?? 0).toLocaleString()}</strong>
+              </p>
+            </div>
+
+            <div>
+              <label style={fS.label}>🔍 No-Plate / No-Ticket Flat Fee (UGX)</label>
+              <p style={{ margin: '0 0 6px', fontSize: 11, color: G.muted }}>
+                Flat rate when a vehicle cannot be identified by plate number and has no traceable ticket.
+              </p>
+              <input style={{ ...fS.input, fontSize: 16, fontWeight: 700 }}
+                type="number" min={0} value={noPlateFee}
+                onChange={e => setNoPlateFee(e.target.value)}
+                placeholder="e.g. 10000" required />
+              <p style={{ margin: '4px 0 0', fontSize: 11, color: G.muted }}>
+                Current: <strong>UGX {Number(lot?.no_plate_fee ?? 0).toLocaleString()}</strong>
+              </p>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 18, padding: '12px 16px', background: '#fffbeb', border: '1.5px solid #fde68a', borderRadius: 10, fontSize: 12, color: '#92400e' }}>
+            ⚠ All three fees are visible to the exit attendant and applied at checkout. Changes take effect immediately for all new transactions.
+          </div>
+
+          <div style={{ marginTop: 14 }}>
+            <button type="submit" disabled={saving} style={{ ...fS.btn, fontSize: 14, padding: '11px 24px' }}>
+              {saving ? 'Saving…' : '💾 Save Special Fees'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 7: FIRE ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function FireAlertsSection({ alerts, onResolve }: {
+  alerts: Alert[];
+  onResolve: (id: string) => void;
+}) {
+  const fireAlerts = alerts.filter(a => a.alert_type === 'fire');
+  const activeFireAlerts = fireAlerts.filter(a => !a.is_resolved);
+
+  const severityColor: Record<string, string> = {
+    critical: G.red, high: '#ea580c', medium: G.orange, low: G.primary,
+  };
+
+  return (
+    <div>
+      <SectionTitle sub="Real-time smoke & fire detector alerts from parking sensors">
+        🔥 Fire &amp; Smoke Alerts
+      </SectionTitle>
+
+      {activeFireAlerts.length > 0 && (
+        <div style={{
+          background: '#7f1d1d', border: '3px solid #ef4444',
+          borderRadius: 14, padding: '20px 24px', marginBottom: 24,
+          animation: 'pulse 1.5s ease-in-out infinite',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <span style={{ fontSize: 40 }}>🔥</span>
+            <div>
+              <p style={{ margin: 0, color: G.white, fontWeight: 900, fontSize: 20 }}>
+                FIRE ALERT — {activeFireAlerts.length} ACTIVE
+              </p>
+              <p style={{ margin: '4px 0 0', color: '#fca5a5', fontSize: 14 }}>
+                Smoke detector(s) have triggered. Immediate action required!
+              </p>
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 16 }}>
+            {activeFireAlerts.map(a => (
+              <div key={a.id} style={{ background: 'rgba(0,0,0,0.3)', borderRadius: 8, padding: '10px 14px', flex: 1, minWidth: 220 }}>
+                <p style={{ margin: 0, color: G.white, fontWeight: 700, fontSize: 13 }}>{a.message}</p>
+                <p style={{ margin: '4px 0 8px', color: '#fca5a5', fontSize: 11 }}>
+                  {new Date(a.created_at).toLocaleString()}
+                </p>
+                <button onClick={() => onResolve(a.id)} style={{
+                  padding: '7px 14px', background: G.white, color: G.red,
+                  border: 'none', borderRadius: 8, cursor: 'pointer', fontWeight: 700, fontSize: 12,
+                }}>
+                  ✓ Mark Resolved
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {activeFireAlerts.length === 0 && (
+        <div style={{
+          background: G.light, border: `1.5px solid ${G.primary}`,
+          borderRadius: 12, padding: '20px 24px', marginBottom: 24, textAlign: 'center',
+        }}>
+          <p style={{ margin: 0, fontSize: 28 }}>✅</p>
+          <p style={{ margin: '8px 0 0', fontWeight: 700, color: G.dark }}>No active fire alerts</p>
+          <p style={{ margin: '4px 0 0', fontSize: 13, color: G.muted }}>All smoke detectors are clear.</p>
+        </div>
+      )}
+
+      {/* All fire alerts history */}
+      <h3 style={{ fontSize: 14, fontWeight: 700, color: G.dark, marginBottom: 12 }}>Alert History</h3>
+      {fireAlerts.length === 0 ? (
+        <p style={{ color: G.muted, fontSize: 13 }}>No fire alerts recorded.</p>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {fireAlerts.map(a => (
+            <div key={a.id} style={{
+              background: G.white, border: `1.5px solid ${a.is_resolved ? G.border : '#fecaca'}`,
+              borderLeft: `5px solid ${a.is_resolved ? G.muted : severityColor[a.severity]}`,
+              borderRadius: 10, padding: '14px 18px',
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              opacity: a.is_resolved ? 0.65 : 1,
+            }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                  <span style={{ fontWeight: 700, color: severityColor[a.severity], fontSize: 13 }}>
+                    [{a.severity.toUpperCase()}] 🔥 FIRE / SMOKE
+                  </span>
+                  {a.is_resolved && <Badge text="Resolved" color={G.muted} />}
+                </div>
+                <p style={{ margin: 0, fontSize: 14, color: G.text }}>{a.message}</p>
+                <p style={{ margin: '4px 0 0', fontSize: 11, color: G.muted }}>
+                  {new Date(a.created_at).toLocaleString()}
+                  {a.is_resolved && a.resolved_at && ` · Resolved ${new Date(a.resolved_at).toLocaleString()}`}
+                </p>
+              </div>
+              {!a.is_resolved && (
+                <button onClick={() => onResolve(a.id)} style={{
+                  padding: '8px 16px', background: G.primary, color: G.white,
+                  border: 'none', borderRadius: 8, cursor: 'pointer', fontWeight: 700, fontSize: 13,
+                  whiteSpace: 'nowrap', marginLeft: 12,
+                }}>✓ Resolve</button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MENU CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+type MenuPage =
+  | 'dashboard'
+  | 'vehicle_categories'
+  | 'manage_slots_gates'
+  | 'vehicles_parked'
+  | 'attendants'
+  | 'pricing'
+  | 'fire_alerts';
+
+interface MenuItem {
+  key: MenuPage;
+  icon: string;
+  label: string;
+  badge?: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN ADMIN DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Module-level helpers (not inside component — TSX can't parse generic arrow fns) ──
+
+/** Normalise paginated {results:[]} OR plain array API response */
+function norm<T>(data: unknown): T[] {
+  if (Array.isArray(data)) return data as T[];
+  const d = data as any;
+  return Array.isArray(d?.results) ? d.results : [];
+}
+
+/** Build a client-side LotAnalytics object from raw data.
+ *  Used as an instant fallback when the analytics endpoint is slow or fails. */
+function buildFallbackAnalytics(
+  lot: ParkingLot,
+  rawSlots: ParkingSlot[],
+  rawTickets: Ticket[],
+): LotAnalytics {
+  const occupied = rawSlots.filter(s => s.status === 'occupied').length;
+  const vacant   = rawSlots.filter(s => s.status === 'vacant').length;
+  const total    = rawSlots.length || (lot as any).capacity || 1;
+  const byType: Record<string, number> = {};
+  rawTickets.forEach(t => { byType[t.vehicle_type] = (byType[t.vehicle_type] ?? 0) + 1; });
+  const revToday = rawTickets
+    .filter(t => t.status !== 'active')
+    .reduce((s, t) => s + Number((t as any).amount_charged ?? 0), 0);
+  return {
+    lot_id:          lot.id,
+    lot_name:        lot.name,
+    total_capacity:  total,
+    occupied,
+    vacant,
+    occupancy_rate:  total ? Math.round((occupied / total) * 100) : 0,
+    tickets_today:   rawTickets.length,
+    revenue_today:   revToday,
+    revenue_month:   0,
+    by_vehicle_type: byType,
+    by_slot_type:    {} as any,
+  };
+}
+
+interface AdminDashboardProps { onLogout: () => void; }
+
+export default function AdminDashboard({ onLogout }: AdminDashboardProps) {
+  const [page,        setPage]        = useState<MenuPage>('dashboard');
+  const [showDisplay, setShowDisplay] = useState(false);
+  const [lots,       setLots]       = useState<ParkingLot[]>([]);
+  const [activeLot,  setActiveLot]  = useState<ParkingLot | null>(null);
+  const [slots,      setSlots]      = useState<ParkingSlot[]>([]);
+  const [slotTypes,  setSlotTypes]  = useState<SlotType[]>([]);
+  const [entrances,  setEntrances]  = useState<Entrance[]>([]);
+  const [exits,      setExits]      = useState<Exit[]>([]);
+  const [analytics,  setAnalytics]  = useState<LotAnalytics | null>(null);
+  const [alerts,     setAlerts]     = useState<Alert[]>([]);
+  const [tickets,    setTickets]    = useState<Ticket[]>([]);
+  const [revenueRows, setRevenueRows] = useState<RevenueRow[]>([]);
+  const [attendants, setAttendants] = useState<User[]>([]);
+  const [loading,    setLoading]    = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [toast,      setToast]      = useState('');
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 3500);
+  }, []);
+
+
+  // ── Load initial data (lots + slot types) ──────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [lotsRes, stRes] = await Promise.all([lotsAPI.list(), slotTypesAPI.list()]);
+        if (cancelled) return;
+        const lotsData      = norm<ParkingLot>(lotsRes.data);
+        const slotTypesData = norm<SlotType>(stRes.data);
+        setLots(lotsData);
+        setSlotTypes(slotTypesData);
+        if (lotsData.length) setActiveLot(lotsData[0]);
+      } catch (err) {
+        console.error('Admin: initial load failed', err);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+
+      // Load attendants (non-blocking)
+      usersAPI.list({ role: 'attendant' })
+        .then(res => { if (!cancelled) setAttendants(norm<User>(res.data)); })
+        .catch(() => {});
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Load lot-specific data whenever activeLot changes ─────────────────────
+  useEffect(() => {
+    if (!activeLot) return;
+    let cancelled = false;
+    const today = new Date().toISOString().slice(0, 10);
+
+    (async () => {
+      // 1. Load slots + today's tickets first (most important — never skip)
+      let rawSlots: ParkingSlot[]   = [];
+      let rawTickets: Ticket[]      = [];
+      try {
+        const [slotsRes, ticketsRes] = await Promise.all([
+          slotsAPI.list({ lot: activeLot.id }),
+          ticketsAPI.list({ lot: activeLot.id, entry_time__date: today }),
+        ]);
+        rawSlots   = norm<ParkingSlot>(slotsRes.data);
+        rawTickets = norm<Ticket>(ticketsRes.data);
+        if (!cancelled) {
+          setSlots(rawSlots);
+          setTickets(rawTickets);
+          // Set fallback analytics immediately so the dashboard is never blank
+          setAnalytics(prev => prev ?? buildFallbackAnalytics(activeLot, rawSlots, rawTickets));
+        }
+      } catch (err) {
+        console.error('Admin: slots/tickets load failed', err);
+        if (!cancelled) setAnalytics(prev => prev ?? buildFallbackAnalytics(activeLot, [], []));
+      }
+
+      // 2. Try the real analytics endpoint — overrides fallback if it works
+      lotsAPI.analytics(activeLot.id)
+        .then(r => { if (!cancelled) setAnalytics(r.data); })
+        .catch(err => console.warn('Admin: analytics endpoint error (using fallback)', err));
+
+      // 3. Load supporting data (alerts, gates, revenue) — non-blocking
+      Promise.allSettled([
+        alertsAPI.list({ lot: activeLot.id }),
+        entrancesAPI.list(activeLot.id),
+        exitsAPI.list(activeLot.id),
+        lotsAPI.revenueReport(activeLot.id),
+      ]).then(([alertsR, entR, exitR, revR]) => {
+        if (cancelled) return;
+        if (alertsR.status === 'fulfilled') setAlerts(norm<Alert>(alertsR.value.data));
+        if (entR.status   === 'fulfilled') setEntrances(norm<Entrance>(entR.value.data));
+        if (exitR.status  === 'fulfilled') setExits(norm<Exit>(exitR.value.data));
+        if (revR.status   === 'fulfilled') {
+          const d = revR.value.data;
+          setRevenueRows(Array.isArray(d) ? d : []);
+        }
+      });
+    })();
+
+    return () => { cancelled = true; };
+  }, [activeLot]);
+
+  // Real-time WebSocket
+  useLotWebSocket(activeLot?.id ?? '', {
+    slot_update: (payload: any) => {
+      setSlots(prev => prev.map(s => s.id === payload.id ? { ...s, ...payload } : s));
+      if (activeLot) {
+        lotsAPI.analytics(activeLot.id)
+          .then(r => setAnalytics(r.data))
+          .catch(() => {
+            // Recompute fallback from current state on analytics failure
+            setSlots(prev => {
+              setTickets(tPrev => {
+                setAnalytics(buildFallbackAnalytics(activeLot, prev, tPrev));
+                return tPrev;
+              });
+              return prev;
+            });
+          });
+      }
+    },
+    alert: (payload: any) => {
+      setAlerts(prev => [payload, ...prev]);
+      if (payload.alert_type === 'fire') {
+        showToast(`🔥 FIRE ALERT: ${payload.message}`);
+        setPage('fire_alerts');
+      }
+    },
+    ticket_created: (payload: any) => {
+      setTickets(prev => [payload, ...prev]);
+    },
+    ticket_closed: (payload: any) => {
+      setTickets(prev => prev.map(t => t.id === payload.id ? { ...t, ...payload } : t));
+    },
+  });
+
+  const handleResolveAlert = async (id: string) => {
+    await alertsAPI.resolve(id);
+    setAlerts(prev => prev.map(a => a.id === id ? { ...a, is_resolved: true } : a));
+    showToast('✅ Alert resolved.');
+  };
+
+  const handleSetSlotStatus = async (id: string, status: string) => {
+    await slotsAPI.setStatus(id, status);
+    setSlots(prev => prev.map(s => s.id === id ? { ...s, status: status as any } : s));
+  };
+
+  const handleOpenEntrance = async (id: string) => {
+    try { await entrancesAPI.openGate(id); showToast('🔓 Entrance gate opened.'); }
+    catch { showToast('❌ Gate command failed.'); }
+  };
+
+  const handleOpenExit = async (id: string) => {
+    try { await exitsAPI.openGate(id); showToast('🔓 Exit gate opened.'); }
+    catch { showToast('❌ Gate command failed.'); }
+  };
+
+  const handleRefreshTickets = useCallback(() => {
+    if (!activeLot) return;
+    const today = new Date().toISOString().slice(0, 10);
+    ticketsAPI.list({ lot: activeLot.id, entry_time__date: today })
+      .then(res => setTickets(norm<Ticket>(res.data)))
+      .catch(() => {});
+  }, [activeLot]);
+
+  // Fire alert count for badge
+  const fireCount = alerts.filter(a => a.alert_type === 'fire' && !a.is_resolved).length;
+  const unresolvedAlerts = alerts.filter(a => !a.is_resolved).length;
+
+  const menuItems: MenuItem[] = [
+    { key: 'dashboard',          icon: '📊', label: 'Dashboard' },
+    { key: 'vehicle_categories', icon: '🚗', label: 'Vehicle Categories' },
+    { key: 'manage_slots_gates', icon: '🏗', label: 'Slots & Gates' },
+    { key: 'vehicles_parked',    icon: '🚙', label: 'Vehicles Parked' },
+    { key: 'attendants',         icon: '👷', label: 'Attendants' },
+    { key: 'pricing',            icon: '💰', label: 'Pricing' },
+    { key: 'fire_alerts',        icon: '🔥', label: 'Fire Alerts', badge: fireCount },
+  ];
+
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', fontFamily: "'Inter', system-ui, sans-serif", background: G.lighter }}>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ width: 48, height: 48, border: '4px solid #d1fae5', borderTopColor: G.primary, borderRadius: '50%', animation: 'spin 0.8s linear infinite', margin: '0 auto 16px' }} />
+          <p style={{ color: G.primary, fontWeight: 600 }}>Loading Admin Dashboard…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Fire notification overlay (flashing banner when critical fire alert active)
+  const criticalFire = alerts.find(a => a.alert_type === 'fire' && !a.is_resolved && a.severity === 'critical');
+
+  return (
+    <div style={{ display: 'flex', minHeight: '100vh', fontFamily: "'Inter', system-ui, sans-serif", background: G.lighter }}>
+
+      {/* ── FIRE ALARM OVERLAY ─────────────────────────────────────────────── */}
+      {criticalFire && page !== 'fire_alerts' && (
+        <div onClick={() => setPage('fire_alerts')} style={{
+          position: 'fixed', top: 0, left: 0, right: 0, zIndex: 9990,
+          background: 'linear-gradient(90deg, #7f1d1d, #dc2626, #7f1d1d)',
+          padding: '10px 24px', display: 'flex', alignItems: 'center', gap: 12,
+          cursor: 'pointer', animation: 'pulse 1s ease-in-out infinite',
+        }}>
+          <span style={{ fontSize: 24 }}>🔥</span>
+          <span style={{ color: G.white, fontWeight: 800, fontSize: 15 }}>
+            CRITICAL FIRE ALERT — {criticalFire.message}
+          </span>
+          <span style={{ marginLeft: 'auto', color: '#fca5a5', fontSize: 12 }}>Click to view →</span>
+        </div>
+      )}
+
+      {/* ── SIDEBAR ─────────────────────────────────────────────────────────── */}
+      <aside style={{
+        width: sidebarOpen ? 240 : 64, background: G.sidebar,
+        display: 'flex', flexDirection: 'column',
+        position: 'sticky', top: 0, height: '100vh',
+        overflowY: 'auto', flexShrink: 0, transition: 'width 0.2s',
+        zIndex: 100,
+      }}>
+        {/* Logo */}
+        <div style={{ padding: '20px 16px 16px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
+          <div style={{ width: 36, height: 36, borderRadius: 10, background: `linear-gradient(135deg, ${G.primary}, ${G.dark})`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <span style={{ fontSize: 20 }}>🅿</span>
+          </div>
+          {sidebarOpen && (
+            <div>
+              <p style={{ margin: 0, color: G.white, fontWeight: 700, fontSize: 13 }}>IUIU Parking</p>
+              <p style={{ margin: 0, color: '#86efac', fontSize: 10 }}>Admin Panel</p>
+            </div>
+          )}
+          <button onClick={() => setSidebarOpen(o => !o)} style={{
+            marginLeft: 'auto', background: 'none', border: 'none', color: '#86efac',
+            cursor: 'pointer', fontSize: 16, padding: 4, flexShrink: 0,
+          }}>{sidebarOpen ? '◀' : '▶'}</button>
+        </div>
+
+        {/* Lot selector */}
+        {sidebarOpen && lots.length > 0 && (
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+            <p style={{ margin: '0 0 8px', color: '#86efac', fontSize: 10, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase' }}>Parking Lot</p>
+            {lots.map(lot => (
+              <button key={lot.id} onClick={() => setActiveLot(lot)} style={{
+                display: 'flex', alignItems: 'center', width: '100%',
+                padding: '8px 10px', border: 'none', borderRadius: 8,
+                background: activeLot?.id === lot.id ? 'rgba(22,163,74,0.25)' : 'transparent',
+                color: activeLot?.id === lot.id ? '#86efac' : '#d1fae5',
+                cursor: 'pointer', fontSize: 12, fontWeight: activeLot?.id === lot.id ? 700 : 400,
+                marginBottom: 2, textAlign: 'left',
+              }}>
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: lot.is_full ? G.red : G.primary, display: 'inline-block', marginRight: 8, flexShrink: 0 }} />
+                {lot.name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Menu items */}
+        <nav style={{ padding: '12px 8px', flex: 1 }}>
+          {menuItems.map(item => (
+            <button key={item.key} onClick={() => setPage(item.key)} style={{
+              display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+              padding: sidebarOpen ? '11px 12px' : '11px 0', justifyContent: sidebarOpen ? 'flex-start' : 'center',
+              border: 'none', borderRadius: 10, cursor: 'pointer', marginBottom: 2,
+              background: page === item.key ? 'rgba(22,163,74,0.3)' : 'transparent',
+              color: page === item.key ? '#86efac' : '#d1fae5',
+              fontWeight: page === item.key ? 700 : 400,
+              fontSize: 13, transition: 'all 0.15s', position: 'relative',
+            }}>
+              <span style={{ fontSize: 18, flexShrink: 0 }}>{item.icon}</span>
+              {sidebarOpen && <span>{item.label}</span>}
+              {item.badge && item.badge > 0 && (
+                <span style={{
+                  marginLeft: sidebarOpen ? 'auto' : 0,
+                  position: sidebarOpen ? 'relative' : 'absolute',
+                  top: sidebarOpen ? 0 : 4, right: sidebarOpen ? 0 : 4,
+                  background: G.red, color: G.white,
+                  borderRadius: '50%', width: 18, height: 18,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 10, fontWeight: 800,
+                }}>{item.badge}</span>
+              )}
+            </button>
+          ))}
+        </nav>
+
+        {/* Alerts summary */}
+        {sidebarOpen && unresolvedAlerts > 0 && (
+          <div style={{ padding: '10px 14px', margin: '0 8px 8px', background: '#7f1d1d30', border: '1px solid #ef444430', borderRadius: 8, fontSize: 11, color: '#fca5a5', textAlign: 'center' }}>
+            ⚠ {unresolvedAlerts} unresolved alert{unresolvedAlerts > 1 ? 's' : ''}
+          </div>
+        )}
+
+        {/* Entrance Display button */}
+        <div style={{ padding: '6px 10px 0' }}>
+          <button onClick={() => setShowDisplay(true)} style={{
+            width: '100%', padding: sidebarOpen ? '10px' : '10px 0',
+            border: '1.5px solid #facc15', borderRadius: 8,
+            background: 'rgba(250,204,21,0.08)', color: '#facc15',
+            cursor: 'pointer', fontWeight: 700, fontSize: 12,
+            display: 'flex', alignItems: 'center', justifyContent: sidebarOpen ? 'flex-start' : 'center', gap: 6,
+          }}>
+            <span style={{ fontSize: 16 }}>📺</span>
+            {sidebarOpen && 'View Entrance Screen'}
+          </button>
+        </div>
+
+        {/* Sign out */}
+        <div style={{ padding: '12px 10px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+          <button onClick={onLogout} style={{
+            width: '100%', padding: sidebarOpen ? '10px' : '10px 0',
+            border: '1.5px solid #4ade80', borderRadius: 8,
+            background: 'transparent', color: '#4ade80',
+            cursor: 'pointer', fontWeight: 600, fontSize: 12,
+          }}>
+            {sidebarOpen ? '⬅ Sign Out' : '⬅'}
+          </button>
+        </div>
+      </aside>
+
+      {/* ── MAIN CONTENT ─────────────────────────────────────────────────── */}
+      <main style={{ flex: 1, padding: '24px 28px', overflowY: 'auto', paddingTop: criticalFire ? 64 : 24 }}>
+
+        {/* Header bar */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24, flexWrap: 'wrap', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div>
+              <h1 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: G.dark }}>
+                {menuItems.find(m => m.key === page)?.icon} {menuItems.find(m => m.key === page)?.label}
+              </h1>
+              <p style={{ margin: '2px 0 0', fontSize: 12, color: G.muted }}>
+                {activeLot?.name ?? 'No lot selected'} · {new Date().toLocaleDateString('en-UG', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+              </p>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            {activeLot && (
+              <span style={{
+                padding: '6px 14px', borderRadius: 20, fontWeight: 700, fontSize: 13,
+                background: activeLot.is_full ? '#fef2f2' : G.light,
+                color: activeLot.is_full ? G.red : G.dark,
+              }}>
+                {activeLot.is_full ? '🔴 LOT FULL' : `🟢 ${activeLot.available_slots} SPACES FREE`}
+              </span>
+            )}
+            {fireCount > 0 && (
+              <button onClick={() => setPage('fire_alerts')} style={{
+                padding: '6px 14px', background: G.red, color: G.white,
+                border: 'none', borderRadius: 20, cursor: 'pointer', fontWeight: 700, fontSize: 13,
+                animation: 'pulse 1.5s ease-in-out infinite',
+              }}>🔥 {fireCount} FIRE ALERT{fireCount > 1 ? 'S' : ''}</button>
+            )}
+          </div>
+        </div>
+
+        {/* ── PAGE CONTENT ────────────────────────────────────────────── */}
+        {page === 'dashboard' && (
+          <DashboardSection
+            analytics={analytics}
+            todayTickets={tickets}
+            revenueRows={revenueRows}
+          />
+        )}
+
+        {page === 'vehicle_categories' && (
+          <VehicleCategoriesSection tickets={tickets} />
+        )}
+
+        {page === 'manage_slots_gates' && (
+       
+          <ManageSlotsGatesSection
+            lots={lots} activeLot={activeLot}
+            slots={slots} slotTypes={slotTypes}
+            entrances={entrances} exits={exits}
+            onSlotCreated={s => setSlots(prev => [...prev, s])}
+            onSlotDeleted={id => setSlots(prev => prev.filter(s => s.id !== id))}
+            onSlotStatus={handleSetSlotStatus}
+            onEntranceCreated={e => setEntrances(prev => [...prev, e])}
+            onEntranceDeleted={id => setEntrances(prev => prev.filter(e => e.id !== id))}
+            onExitCreated={e => setExits(prev => [...prev, e])}
+            onExitDeleted={id => setExits(prev => prev.filter(e => e.id !== id))}
+            onOpenEntrance={handleOpenEntrance}
+            onOpenExit={handleOpenExit}
+            showToast={showToast}
+          />
+        )}
+
+        {page === 'vehicles_parked' && (
+          <VehiclesParkedSection
+            tickets={tickets}
+            onRefresh={handleRefreshTickets}
+          />
+        )}
+
+        {page === 'attendants' && (
+          <AttendantsSection
+            attendants={attendants}
+            lots={lots}
+            entrances={entrances}
+            exits={exits}
+            onCreated={u => setAttendants(prev => [...prev, u])}
+            onDeleted={id => setAttendants(prev => prev.filter(a => a.id !== id))}
+            onOpenGate={(type, id) => type === 'entrance' ? handleOpenEntrance(id) : handleOpenExit(id)}
+            showToast={showToast}
+          />
+        )}
+
+        {page === 'pricing' && (
+          <Pricin

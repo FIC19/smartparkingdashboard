@@ -1,0 +1,29 @@
+# Python / Django
+backend/venv/
+backend/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+backend/.env
+backend/db.sqlite3
+backend/staticfiles/
+backend/media/
+backend/firebase-credentials.json
+*.log
+
+# Node / React
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
