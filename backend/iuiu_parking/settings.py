@@ -3,6 +3,7 @@ IUIU Smart Parking — Django Settings
 Copy this to your project and fill in the env-specific values.
 """
 import os
+import dj_database_url
 from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
@@ -17,6 +18,10 @@ DEBUG      = os.environ.get('DEBUG', 'True') == 'True'
 # In production set ALLOWED_HOSTS env var explicitly.
 _default_hosts = 'localhost,127.0.0.1,0.0.0.0'
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', _default_hosts).split(',')
+# Railway injects RAILWAY_PUBLIC_DOMAIN — add it automatically
+_railway_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+if _railway_domain:
+    ALLOWED_HOSTS.append(_railway_domain)
 # Allow all hosts in DEBUG mode (local LAN deployments with dynamic IPs)
 if DEBUG:
     ALLOWED_HOSTS = ['*']
@@ -59,7 +64,11 @@ ASGI_APPLICATION = 'iuiu_parking.asgi.application'
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
-if os.environ.get('USE_SQLITE', 'False') == 'True':
+# Railway provides DATABASE_URL; fall back to individual vars or SQLite for local dev.
+_database_url = os.environ.get('DATABASE_URL')
+if _database_url:
+    DATABASES = {'default': dj_database_url.parse(_database_url, conn_max_age=600)}
+elif os.environ.get('USE_SQLITE', 'False') == 'True':
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
@@ -113,6 +122,8 @@ CORS_ALLOWED_ORIGINS = os.environ.get(
     'http://localhost:3000,http://localhost:5173'
 ).split(',')
 CORS_ALLOW_CREDENTIALS = True
+# In production, also allow any *.vercel.app origin automatically
+CORS_ALLOWED_ORIGIN_REGEXES = [r'^https://.*\.vercel\.app$'] if not DEBUG else []
 
 # ── Channels (WebSocket) ──────────────────────────────────────────────────────
 
