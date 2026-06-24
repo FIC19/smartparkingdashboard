@@ -19,9 +19,11 @@ DEBUG      = os.environ.get('DEBUG', 'True') == 'True'
 _default_hosts = 'localhost,127.0.0.1,0.0.0.0'
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', _default_hosts).split(',')
 # Railway injects RAILWAY_PUBLIC_DOMAIN — add it automatically
-_railway_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
-if _railway_domain:
-    ALLOWED_HOSTS.append(_railway_domain)
+# Render injects RENDER_EXTERNAL_HOSTNAME; Railway injects RAILWAY_PUBLIC_DOMAIN
+for _host_var in ('RENDER_EXTERNAL_HOSTNAME', 'RAILWAY_PUBLIC_DOMAIN'):
+    _h = os.environ.get(_host_var)
+    if _h:
+        ALLOWED_HOSTS.append(_h)
 # Allow all hosts in DEBUG mode (local LAN deployments with dynamic IPs)
 if DEBUG:
     ALLOWED_HOSTS = ['*']
