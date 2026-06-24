@@ -9,8 +9,13 @@ import type { WSMessageType } from '../types';
 type Handler<T = unknown> = (payload: T) => void;
 type HandlerMap = Partial<Record<WSMessageType, Handler<any>>>;
 
-const WS_BASE           = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000';
 const RECONNECT_DELAY   = 3000;
+
+function websocketBase() {
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL;
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}`;
+}
 
 export function useDeviceWebSocket(handlers: HandlerMap) {
   const wsRef          = useRef<WebSocket | null>(null);
@@ -27,7 +32,7 @@ export function useDeviceWebSocket(handlers: HandlerMap) {
 
     const stored = localStorage.getItem('tokens');
     const token  = stored ? (JSON.parse(stored) as { access: string }).access : '';
-    const url    = `${WS_BASE}/ws/devices/?token=${token}`;
+    const url    = `${websocketBase()}/ws/devices/?token=${token}`;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;

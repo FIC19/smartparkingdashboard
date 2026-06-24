@@ -1,70 +1,91 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { auth, db } from '../firebase';
-import type { User, UserRole } from '../types';
+import React, {
+  createContext, useCallback, useContext, useEffect, useState, type ReactNode,
+} from 'react';
+import { authAPI, usersAPI } from '../api/client';
+import type { AuthTokens, User, UserRole } from '../types';
 
 interface AuthContextValue {
-  user:            User | null;
-  isAuthenticated: boolean;
-  isLoading:       boolean;
-  login:           (username: string, password: string) => Promise<void>;
-  signup:          (username: string, password: string, role: UserRole) => Promise<void>;
-  logout:          () => void;
-  hasRole:         (...roles: UserRole[]) => boolean;
+  user:             User | null;
+  isAuthenticated:  boolean;
+  isLoading:        boolean;
+  login:            (username: string, password: string) => Promise<void>;
+  signup:           (username: string, password: string, role: UserRole) => Promise<void>;
+  logout:           () => void;
+  hasRole:          (...roles: UserRole[]) => boolean;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+function readTokens(): AuthTokens | null {
+  const raw = localStorage.getItem('tokens');
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as AuthTokens;
+  } catch {
+    localStorage.removeItem('tokens');
+    return null;
+  }
+}
+
+function storeTokens(tokens: AuthTokens) {
+  localStorage.setItem('tokens', JSON.stringify(tokens));
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user,      setUser]      = useState<User | null>(null);
+  const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        try {
-          const snap = await getDoc(doc(db, 'users', firebaseUser.uid));
-          if (snap.exists()) {
-            setUser({ id: snap.id, ...snap.data() } as User);
-          } else {
-            setUser(null);
-          }
-        } catch {
-          setUser(null);
-        }
-      } else {
-        setUser(null);
+    let cancelled = false;
+
+    async function restoreSession() {
+      const tokens = readTokens();
+      if (!tokens?.access) {
+        setIsLoading(false);
+        return;
       }
-      setIsLoading(false);
-    });
-    return unsub;
+
+      try {
+        const res = await authAPI.me();
+        if (!cancelled) setUser(res.data);
+      } catch {
+        localStorage.removeItem('tokens');
+        if (!cancelled) setUser(null);
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+
+    restoreSession();
+    return () => { cancelled = true; };
   }, []);
 
   const login = useCallback(async (username: string, password: string) => {
-    const email = `${username.trim()}@iuiupark.app`;
-    const cred  = await signInWithEmailAndPassword(auth, email, password);
-    const snap  = await getDoc(doc(db, 'users', cred.user.uid));
-    if (!snap.exists()) throw new Error('User profile not found. Contact administrator.');
-    setUser({ id: snap.id, ...snap.data() } as User);
+    const tokenRes = await authAPI.login(username.trim(), password);
+    storeTokens({
+      access: tokenRes.data.access,
+      refresh: tokenRes.data.refresh,
+    });
+
+    const meRes = await authAPI.me();
+    setUser(meRes.data);
   }, []);
 
   const signup = useCallback(async (username: string, password: string, role: UserRole) => {
-    const email = `${username.trim()}@iuiupark.app`;
-    const cred  = await createUserWithEmailAndPassword(auth, email, password);
-    const userData = {
+    await usersAPI.create({
       username: username.trim(),
+      password,
       role,
-      name: username.trim(),
-      email,
-      created_at: new Date().toISOString()
-    };
-    await setDoc(doc(db, 'users', cred.user.uid), userData);
-    setUser({ id: cred.user.uid, ...userData } as User);
-  }, []);
+      first_name: username.trim(),
+      last_name: '',
+      email: `${username.trim()}@iuiupark.app`,
+      phone: '',
+    });
+    await login(username, password);
+  }, [login]);
 
   const logout = useCallback(() => {
-    signOut(auth);
+    localStorage.removeItem('tokens');
     setUser(null);
   }, []);
 
@@ -73,7 +94,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [user]);
 
   return (
-    <AuthContext.Provider value={{ user, isAuthenticated: !!user, isLoading, login, signup, logout, hasRole }}>
+    <AuthContext.Provider value={{
+      user,
+      isAuthenticated: !!user,
+      isLoading,
+      login,
+      signup,
+      logout,
+      hasRole,
+    }}
+    >
       {children}
     </AuthContext.Provider>
   );
