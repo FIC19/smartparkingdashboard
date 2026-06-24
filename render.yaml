@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: iuiu-smart-parking-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt && python manage.py collectstatic --noinput
+    startCommand: python manage.py migrate --noinput && daphne -b 0.0.0.0 -p $PORT iuiu_parking.asgi:application
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: False
+      - key: USE_SQLITE
+        value: False
+      - key: USE_REDIS_CHANNELS
+        value: False
+      - key: DATABASE_URL
+        fromDatabase:
+          name: iuiu-parking-db
+          property: connectionString
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+databases:
+  - name: iuiu-parking-db
+    databaseName: iuiu_parking
+    plan: free
